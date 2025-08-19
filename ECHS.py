@@ -5,7 +5,6 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import pymongo
 import bcrypt
-import gridfs
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
 from bson import ObjectId
@@ -15,6 +14,7 @@ import json
 import os
 from dotenv import load_dotenv
 from gridfs import GridFS
+from typing import Optional
 
 load_dotenv()
 
@@ -150,7 +150,7 @@ async def extract_echs_card(
 
         data = await run_ocr_prompt(prompt, base64_image)
 
-        ocr_collection.insert_one({
+        result = ocr_collection.insert_one({
             "user_id": str(current_user["_id"]),
             "doc_type": "echs_card",
             "image_file_id": file_id,
@@ -161,6 +161,7 @@ async def extract_echs_card(
         return {
             "status": "success", 
             "doc_type": "echs_card", 
+            "ocr_result_id": str(result.inserted_id),
             "image_file_id": str(file_id),
             "data": data
         }
@@ -201,7 +202,7 @@ async def extract_temporary_slip(
 
         data = await run_ocr_prompt(prompt, base64_image)
 
-        ocr_collection.insert_one({
+        result = ocr_collection.insert_one({
             "user_id": str(current_user["_id"]),
             "doc_type": "temporary_slip",
             "image_file_id": file_id,
@@ -212,6 +213,7 @@ async def extract_temporary_slip(
         return {
             "status": "success", 
             "doc_type": "temporary_slip", 
+            "ocr_result_id": str(result.inserted_id),
             "image_file_id": str(file_id),
             "data": data
         }
@@ -260,7 +262,7 @@ async def extract_referral_letter(
 
         data = await run_ocr_prompt(prompt, base64_image)
 
-        ocr_collection.insert_one({
+        result = ocr_collection.insert_one({
             "user_id": str(current_user["_id"]),
             "doc_type": "referral_letter",
             "image_file_id": file_id,
@@ -271,6 +273,7 @@ async def extract_referral_letter(
         return {
             "status": "success", 
             "doc_type": "referral_letter",
+            "ocr_result_id": str(result.inserted_id),
             "image_file_id": str(file_id), 
             "data": data}
 
@@ -304,7 +307,7 @@ async def extract_aadhar_card(
 
         data = await run_ocr_prompt(prompt, base64_image)
 
-        ocr_collection.insert_one({
+        result = ocr_collection.insert_one({
             "user_id": str(current_user["_id"]),
             "doc_type": "aadhar_card",
             "image_file_id": file_id,
@@ -315,6 +318,7 @@ async def extract_aadhar_card(
         return {
             "status": "success", 
             "doc_type": "aadhar_card", 
+            "ocr_result_id": str(result.inserted_id),
             "image_file_id": str(file_id),
             "data": data
         }
@@ -354,3 +358,114 @@ async def run_ocr_prompt(prompt, base64_image):
 def get_image(file_id: str, current_user: dict = Depends(get_current_user)):
     grid_out = fs.get(ObjectId(file_id))
     return StreamingResponse(grid_out, media_type=grid_out.content_type)
+
+# Collection for storing history
+requests_collection = db["requests_history"]
+
+class FinalSubmissionRequest(BaseModel):
+    echs_card_result_id: Optional[str] = None
+    referral_letter_result_id: Optional[str] = None
+    aadhar_card_result_id: Optional[str] = None
+    
+class SubmitRequestPayload(BaseModel):
+    matched: Optional[bool] = None
+
+# Submit request API (stores OCR doc IDs, not file_ids)
+@app.post("/submit_request")
+def submit_request(payload: SubmitRequestPayload, current_user: dict = Depends(get_current_user)):
+    echs_or_slip = ocr_collection.find_one(
+        {"user_id": str(current_user["_id"]), "doc_type": {"$in": ["echs_card", "temporary_slip"]}},
+        sort=[("_id", -1)]
+    )
+    referral = ocr_collection.find_one(
+        {"user_id": str(current_user["_id"]), "doc_type": "referral_letter"},
+        sort=[("_id", -1)]
+    )
+    aadhar = ocr_collection.find_one(
+        {"user_id": str(current_user["_id"]), "doc_type": "aadhar_card"},
+        sort=[("_id", -1)]
+    )
+
+    if not (echs_or_slip or referral or aadhar):
+        raise HTTPException(status_code=400, detail="No documents found for submission")
+
+    request_doc = {
+        "user_id": str(current_user["_id"]),
+        "echs_card_result_id": str(echs_or_slip["_id"]) if echs_or_slip else None,
+        "referral_letter_result_id": str(referral["_id"]) if referral else None,
+        "aadhar_card_result_id": str(aadhar["_id"]) if aadhar else None,
+        "matched": payload.matched,
+        "created_at": datetime.utcnow()
+    }
+
+    result = requests_collection.insert_one(request_doc)
+
+    # Add request_id to request_doc and convert all ObjectIds to str for response
+    request_doc["_id"] = str(result.inserted_id)
+
+    return {"status": "success", "request_id": request_doc["_id"], "request_doc": request_doc}
+
+# Get history for logged-in user
+@app.get("/history")
+def get_history(current_user: dict = Depends(get_current_user)):
+    history = list(requests_collection.find({"user_id": str(current_user["_id"])}))
+    for h in history:
+        h["_id"] = str(h["_id"])
+    return {"status": "success", "history": history}
+
+@app.get("/admin/user_history/{user_id}")
+def get_user_history(user_id: str):
+    try:
+        history = list(requests_collection.find({"user_id": user_id}))
+        for h in history:
+            h["_id"] = str(h["_id"])
+
+            def attach_ocr_data(field_name, key_name):
+                if h.get(field_name):
+                    ocr_result = ocr_collection.find_one({"_id": ObjectId(h[field_name])})
+                    if ocr_result:
+                        h[key_name] = {
+                            "id": str(ocr_result["_id"]),
+                            "data": ocr_result.get("extracted_data", {}),
+                            "uploaded_at": ocr_result.get("uploaded_at")
+                        }
+                    else:
+                        h[key_name] = None
+                else:
+                    h[key_name] = None
+                h.pop(field_name, None)  
+
+            attach_ocr_data("echs_card_result_id", "echs_card_or_temporary_slip")
+            attach_ocr_data("referral_letter_result_id", "referral_letter")
+            attach_ocr_data("aadhar_card_result_id", "aadhar_card")
+
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "submission_count": len(history),
+            "history": history
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/user_stats")
+def get_user_stats():
+    try:
+        pipeline = [
+            {"$group": {"_id": "$user_id", "submission_count": {"$sum": 1}}}
+        ]
+        stats = list(requests_collection.aggregate(pipeline))
+        # Attach user info
+        for stat in stats:
+            user = users_collection.find_one({"_id": ObjectId(stat["_id"])})
+            stat["user"] = {
+                "user_id": stat["_id"],
+                "full_name": f"{user['first_name']} {user['last_name']}",
+                "email": user["email"]
+            }
+            stat["_id"] = str(stat["_id"]) 
+        return {"status": "success", "user_stats": stats}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
