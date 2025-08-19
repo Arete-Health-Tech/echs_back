@@ -93,14 +93,32 @@ def register(
 
 # Login
 @app.post("/login")
+@app.post("/login")
 def login(email: str = Form(...), password: str = Form(...)):
     user = users_collection.find_one({"email": email})
     if not user:
         raise HTTPException(status_code=400, detail="Invalid email or password")
     if not bcrypt.checkpw(password.encode("utf-8"), user["password"].encode("utf-8")):
         raise HTTPException(status_code=400, detail="Invalid email or password")
+
     token = create_access_token({"sub": user["email"]})
-    return {"access_token": token, "token_type": "bearer"}
+
+    user_data = {
+        "user_id": str(user["_id"]),
+        "first_name": user["first_name"],
+        "last_name": user["last_name"],
+        "full_name": f"{user['first_name']} {user['last_name']}",
+        "email": user["email"],
+        "phone": user["phone"],
+        "age": user["age"]
+    }
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": user_data
+    }
+
 
 # Profile
 @app.get("/profile")
