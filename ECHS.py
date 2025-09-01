@@ -128,6 +128,10 @@ def login(email: str = Form(...), password: str = Form(...)):
         "user": user_data
     }
 
+# Logout
+@app.post("/logout")
+def logout(current_user: dict = Depends(get_current_user)):
+    return {"status": "success", "message": "Logged out successfully"}
 
 # Profile
 @app.get("/profile")
