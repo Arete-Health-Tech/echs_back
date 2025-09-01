@@ -1,3 +1,9 @@
+import asyncio
+import sys
+
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
@@ -8,22 +14,26 @@ import bcrypt
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
 from bson import ObjectId
-import openai
+from openai import OpenAI
 import base64
 import json
 import os
 from dotenv import load_dotenv
 from gridfs import GridFS
 from typing import Optional
+import re
+from playwright.sync_api import sync_playwright
+import traceback
 
 load_dotenv()
 
 # MongoDB connection
-client = pymongo.MongoClient(
+client_mongo = pymongo.MongoClient(
     os.getenv("MONGO_URL")
 )
-db = client["hospital_app"]
+db = client_mongo["hospital_app"]
 users_collection = db["users"]
+collection = db["ocr_results"]
 
 # JWT config
 SECRET_KEY = os.getenv("JWT_SECRET_KEY")
@@ -43,6 +53,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# OpenAI client (new SDK)
+client = OpenAI(api_key=os.getenv("OPENAI_API"))
 
 # JWT Helpers
 def create_access_token(data: dict, expires_minutes: int = ACCESS_TOKEN_EXPIRE_MINUTES):
@@ -93,7 +106,6 @@ def register(
 
 # Login
 @app.post("/login")
-@app.post("/login")
 def login(email: str = Form(...), password: str = Form(...)):
     user = users_collection.find_one({"email": email})
     if not user:
@@ -131,7 +143,7 @@ def get_profile(current_user: dict = Depends(get_current_user)):
     }
 
 # OpenAI API key
-openai.api_key = os.getenv("OPENAI_API")
+client.api_key = os.getenv("OPENAI_API")
 
 # New collection for OCR results
 ocr_collection = db["ocr_results"]
@@ -212,7 +224,6 @@ async def extract_temporary_slip(
         - Category
         - Valid Upto
         - Category of Ward
-        - OIC Stamp
         There is no separate field called "Patient Name".
         If any field is missing, return "Not Found".
         Return only valid JSON.
@@ -254,6 +265,7 @@ async def extract_referral_letter(
 
         prompt = """
         You are analyzing a Referral Letter. Extract:
+        - Polyclinic Name
         - Name of Patient
         - Referral No
         - Valid Upto
@@ -347,7 +359,7 @@ async def extract_aadhar_card(
 
 # ---------- Helper Function for OCR ----------
 async def run_ocr_prompt(prompt, base64_image):
-    response = openai.ChatCompletion.create(
+    response = client.chat.completions.create(
         model="gpt-4o",
         temperature=0,
         messages=[
@@ -363,13 +375,15 @@ async def run_ocr_prompt(prompt, base64_image):
         max_tokens=1500
     )
 
-    reply = response['choices'][0]['message']['content'].strip()
+    reply = response.choices[0].message.content.strip()
+
     if reply.startswith("```json"):
         reply = reply.removeprefix("```json").removesuffix("```").strip()
     elif reply.startswith("```"):
         reply = reply.removeprefix("```").removesuffix("```").strip()
 
     return json.loads(reply)
+
 
 # Retrieving the stored image
 @app.get("/image/{file_id}")
@@ -422,6 +436,179 @@ def submit_request(payload: SubmitRequestPayload, current_user: dict = Depends(g
     request_doc["_id"] = str(result.inserted_id)
 
     return {"status": "success", "request_id": request_doc["_id"], "request_doc": request_doc}
+
+class OCRUpdateRequest(BaseModel):
+    extracted_data: dict
+
+@app.get("/ocr/{ocr_result_id}")
+def get_ocr_result(
+    ocr_result_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    ocr_result = ocr_collection.find_one({"_id": ObjectId(ocr_result_id)})
+    if not ocr_result:
+        raise HTTPException(status_code=404, detail="OCR result not found")
+    if str(ocr_result["user_id"]) != str(current_user["_id"]):
+        raise HTTPException(status_code=403, detail="Not authorized to view this record")
+
+    ocr_result["_id"] = str(ocr_result["_id"])
+    if ocr_result.get("image_file_id"):
+        ocr_result["image_file_id"] = str(ocr_result["image_file_id"])
+    return {"status": "success", "ocr_result": ocr_result}
+
+def objid_to_str(doc):
+    """Recursively convert all ObjectIds in a dict or list to strings."""
+    if isinstance(doc, ObjectId):
+        return str(doc)
+    elif isinstance(doc, dict):
+        return {k: objid_to_str(v) for k, v in doc.items()}
+    elif isinstance(doc, list):
+        return [objid_to_str(item) for item in doc]
+    return doc
+
+
+@app.put("/ocr/{ocr_result_id}")
+async def update_ocr_result(
+    ocr_result_id: str,
+    payload: OCRUpdateRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        object_id = ObjectId(ocr_result_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ObjectId format")
+
+    ocr_result = ocr_collection.find_one({"_id": object_id})
+    if not ocr_result:
+        raise HTTPException(status_code=404, detail="OCR result not found")
+
+    if str(ocr_result["user_id"]) != str(current_user["_id"]):
+        raise HTTPException(status_code=403, detail="Not authorized to edit this record")
+
+    # Perform update
+    ocr_collection.update_one(
+        {"_id": object_id},
+        {"$set": {
+            "extracted_data": payload.extracted_data,
+            "updated_at": datetime.utcnow()
+        }}
+    )
+
+    # Fetch updated doc
+    updated = ocr_collection.find_one({"_id": object_id})
+    if not updated:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return objid_to_str(updated)
+
+@app.post("/generate_claim_id")
+def generate_claim_id():
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=False)
+            page = browser.new_page()
+
+            # Fetch latest referral
+            referral = collection.find_one(sort=[("_id", -1)])
+            if not referral:
+                raise Exception("No referral data found in MongoDB!")
+
+            # Go to login page
+            page.goto("https://www.echsbpa.utiitsl.com/ECHS/")
+            page.fill("#username", "parashos")
+            page.fill("#password", "Paras@123")
+
+            # --- CAPTCHA Handling ---
+            captcha_selector = "#img_captcha"
+            page.wait_for_selector(captcha_selector)
+            captcha_buffer = page.locator(captcha_selector).screenshot()
+            base64_image = f"data:image/png;base64,{base64.b64encode(captcha_buffer).decode()}"
+
+            response = client.responses.create(
+                model="gpt-4o-mini",
+                input=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Read the digits from this CAPTCHA image. Only return the numbers."},
+                        {"type": "input_image", "image_url": base64_image}
+                    ],
+                }]
+            )
+
+            captcha_text = response.output_text
+            captcha_text = re.sub(r"[^0-9]", "", captcha_text).strip()
+            page.fill("#txtCaptcha", captcha_text)
+            page.get_by_role("button", name="Sign In").click()
+            page.wait_for_timeout(3000)
+
+            # Close popup if exists
+            try:
+                popup_selector = 'button:has-text("Close")'
+                if page.locator(popup_selector).is_visible():
+                    page.click(popup_selector)
+            except:
+                pass
+
+            # Fill referral data
+            page.locator("#ihaveseennmi").check()
+            page.get_by_role("link", name="Intimation").click()
+            page.get_by_role("link", name="Accept Referral").click()
+
+            referral_no = referral["extracted_data"]["Referral No"]
+            center_code = referral_no[:4]
+            trimmed_referral = referral_no[4:]
+
+            center_map = {
+                "0147": "5037",
+                "0144": "5036",
+                "0142": "5033",
+                "0143": "5031",
+                "0146": "5038",
+                "0145": "5042",
+                "0431": "5076",
+                "0148": "5043"
+            }
+
+            if center_code in center_map:
+                page.locator("#referredDispensary").select_option(center_map[center_code])
+            else:
+                raise Exception(f"Center code {center_code} not mapped!")
+
+            page.locator("(//input[@name='cardnum2'])[1]").fill(trimmed_referral)
+            page.locator("(//input[@name='serviceNo'])[1]").fill(referral["extracted_data"]["Service No"])
+
+            page.get_by_role("button", name="Search").click()
+            page.wait_for_timeout(6000)
+
+            # Extract claim ID from popup
+            popup_selector2 = "#ws_alert_dialog"
+            page.wait_for_selector(popup_selector2, state="visible")
+            popup_text = page.locator(popup_selector2).inner_text()
+
+            match = re.search(r"claim id\s*-\s*(\d+)", popup_text, re.IGNORECASE)
+            claim_id = match.group(1) if match else None
+
+            if not claim_id:
+                raise Exception("Claim ID not found!")
+
+            # Update in MongoDB
+            collection.update_one(
+                {"_id": referral["_id"]},
+                {"$set": {"extracted_data.Claim ID": claim_id}}
+            )
+
+            browser.close()
+
+        return {"status": "success", "claim_id": claim_id}
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e) or repr(e),
+            "type": e.__class__.__name__,
+            "traceback": traceback.format_exc()
+        }
+
 
 # Get history for logged-in user
 @app.get("/history")
