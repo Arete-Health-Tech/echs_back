@@ -31,9 +31,10 @@ load_dotenv()
 client_mongo = pymongo.MongoClient(
     os.getenv("MONGO_URL")
 )
-db = client_mongo["hospital_app"]
+db = client_mongo[os.getenv("MONGO_NAME")]
 users_collection = db["users"]
-collection = db["ocr_results"]
+ocr_collection = db["ocr_results"]
+file_collection = db["files"]
 
 # JWT config
 SECRET_KEY = os.getenv("JWT_SECRET_KEY")
@@ -86,6 +87,7 @@ def register(
     confirm_password: str = Form(...)
 ):
     if users_collection.find_one({"email": email}):
+        print("thi si for register")
         raise HTTPException(status_code=400, detail="Email already registered")
     if password != confirm_password:
         raise HTTPException(status_code=400, detail="Passwords do not match")
@@ -145,10 +147,6 @@ def get_profile(current_user: dict = Depends(get_current_user)):
 
 # OpenAI API key
 client.api_key = os.getenv("OPENAI_API")
-
-# New collection for OCR results
-ocr_collection = db["ocr_results"]
-file_collection = db["files"]
 
 fs = GridFS(db)
 
@@ -288,6 +286,8 @@ async def extract_referral_letter(
         - Polyclinic Remarks
         - Claim ID
         If missing, return "Not Found".
+        Don't mix up claim ID and Referral Number.
+        Referral Number is of 14 digits.
         Return only valid JSON.
         """
 
@@ -510,7 +510,7 @@ def generate_claim_id():
             page = browser.new_page()
 
             # Fetch latest referral
-            referral = collection.find_one(sort=[("_id", -1)])
+            referral = ocr_collection.find_one(sort=[("_id", -1)])
             if not referral:
                 raise Exception("No referral data found in MongoDB!")
 
@@ -593,7 +593,7 @@ def generate_claim_id():
                 raise Exception("Claim ID not found!")
 
             # Update in MongoDB
-            collection.update_one(
+            ocr_collection.update_one(
                 {"_id": referral["_id"]},
                 {"$set": {"extracted_data.Claim ID": claim_id}}
             )
@@ -610,6 +610,33 @@ def generate_claim_id():
             "traceback": traceback.format_exc()
         }
 
+@app.get("/search/{referral_no}")
+def search_referral_letter(
+    referral_no: str,
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        # Search in referral letters of the logged-in user
+        query = {
+            "doc_type": "referral_letter",
+            "user_id": str(current_user["_id"]),
+            "extracted_data.Referral No": referral_no
+        }
+
+        result = ocr_collection.find_one(query)
+
+        if not result:
+            raise HTTPException(status_code=404, detail="Referral letter not found")
+
+        # Convert ObjectIds to strings for response
+        result["_id"] = str(result["_id"])
+        if result.get("image_file_id"):
+            result["image_file_id"] = str(result["image_file_id"])
+
+        return {"status": "success", "referral_letter": result}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Get history for logged-in user
 @app.get("/history")
@@ -619,8 +646,10 @@ def get_history(current_user: dict = Depends(get_current_user)):
         h["_id"] = str(h["_id"])
     return {"status": "success", "history": history}
 
+
 @app.get("/admin/user_history/{user_id}")
 def get_user_history(user_id: str):
+    print(user_id)
     try:
         history = list(requests_collection.find({"user_id": user_id}))
         for h in history:
