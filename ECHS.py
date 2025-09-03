@@ -18,6 +18,8 @@ from openai import OpenAI
 import base64
 import json
 import os
+import pandas as pd
+from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 from gridfs import GridFS
 from typing import Optional
@@ -467,40 +469,64 @@ def objid_to_str(doc):
         return [objid_to_str(item) for item in doc]
     return doc
 
-
-@app.put("/ocr/{ocr_result_id}")
-async def update_ocr_result(
-    ocr_result_id: str,
-    payload: OCRUpdateRequest,
+@app.put("/request_update/{request_id}")
+async def update_request_ocr_results(
+    request_id: str,
+    payload: dict,
     current_user: dict = Depends(get_current_user)
 ):
     try:
-        object_id = ObjectId(ocr_result_id)
+        request_obj = requests_collection.find_one({"_id": ObjectId(request_id)})
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid ObjectId format")
+        raise HTTPException(status_code=400, detail="Invalid request_id format")
 
-    ocr_result = ocr_collection.find_one({"_id": object_id})
-    if not ocr_result:
-        raise HTTPException(status_code=404, detail="OCR result not found")
+    if not request_obj:
+        raise HTTPException(status_code=404, detail="Request not found")
 
-    if str(ocr_result["user_id"]) != str(current_user["_id"]):
-        raise HTTPException(status_code=403, detail="Not authorized to edit this record")
+    if str(request_obj["user_id"]) != str(current_user["_id"]):
+        raise HTTPException(status_code=403, detail="Not authorized to edit this request")
 
-    # Perform update
-    ocr_collection.update_one(
-        {"_id": object_id},
-        {"$set": {
-            "extracted_data": payload.extracted_data,
-            "updated_at": datetime.utcnow()
-        }}
-    )
+    updates = payload.get("updates", [])
+    if not updates:
+        raise HTTPException(status_code=400, detail="No updates provided")
 
-    # Fetch updated doc
-    updated = ocr_collection.find_one({"_id": object_id})
-    if not updated:
-        raise HTTPException(status_code=404, detail="Document not found")
+    updated_docs = []
+    for update in updates:
+        doc_type = update.get("doc_type")
+        extracted_data = update.get("extracted_data", {})
 
-    return objid_to_str(updated)
+        if not doc_type or not extracted_data:
+            continue
+
+        # Map request_obj field names with doc_type
+        if doc_type == "echs_card":
+            ocr_id = request_obj.get("echs_card_result_id")
+        elif doc_type == "referral_letter":
+            ocr_id = request_obj.get("referral_letter_result_id")
+        elif doc_type == "aadhar_card":
+            ocr_id = request_obj.get("aadhar_card_result_id")
+        else:
+            continue
+
+        if not ocr_id:
+            continue
+
+        # Prepare dot-notation updates for partial field update
+        set_fields = {f"extracted_data.{k}": v for k, v in extracted_data.items()}
+        set_fields["updated_at"] = datetime.utcnow()
+
+        ocr_collection.update_one(
+            {"_id": ObjectId(ocr_id)},
+            {"$set": set_fields}
+        )
+        updated_docs.append(str(ocr_id))
+
+    return {
+        "status": "success",
+        "updated_count": len(updated_docs),
+        "request_id": request_id,
+        "updated_docs": updated_docs
+    }
 
 @app.post("/generate_claim_id")
 def generate_claim_id():
@@ -702,5 +728,42 @@ def get_user_stats():
             }
             stat["_id"] = str(stat["_id"]) 
         return {"status": "success", "user_stats": stats}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@app.get("/admin/export_patient_data")
+def export_patient_data():
+    try:
+        # Fetch all OCR docs
+        docs = list(ocr_collection.find({}))
+        
+        # Flatten documents for CSV
+        rows = []
+        for d in docs:
+            rows.append({
+                "patient_user_id": str(d.get("user_id", "")),
+                "doc_type": d.get("doc_type", ""),
+                "uploaded_at": d.get("uploaded_at", ""),
+                **d.get("extracted_data", {})  # flatten extracted fields
+            })
+        
+        if not rows:
+            raise HTTPException(status_code=404, detail="No patient data found")
+
+        # Convert to DataFrame
+        df = pd.DataFrame(rows)
+
+        # Save as CSV
+        file_path = "patient_data_export.csv"
+        df.to_csv(file_path, index=False)
+
+        return FileResponse(
+            path=file_path,
+            filename="patient_data_export.csv",
+            media_type="text/csv"
+        )
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
