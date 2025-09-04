@@ -375,7 +375,7 @@ async def run_ocr_prompt(prompt, base64_image):
                 ]
             }
         ],
-        max_tokens=1500
+        max_tokens=3000
     )
 
     reply = response.choices[0].message.content.strip()
