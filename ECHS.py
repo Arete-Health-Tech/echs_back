@@ -490,7 +490,7 @@ async def update_request_ocr_results(
     if not updates:
         raise HTTPException(status_code=400, detail="No updates provided")
 
-    updated_docs = []
+    # Step 1: Apply updates
     for update in updates:
         doc_type = update.get("doc_type")
         extracted_data = update.get("extracted_data", {})
@@ -511,7 +511,6 @@ async def update_request_ocr_results(
         if not ocr_id:
             continue
 
-        # Prepare dot-notation updates for partial field update
         set_fields = {f"extracted_data.{k}": v for k, v in extracted_data.items()}
         set_fields["updated_at"] = datetime.utcnow()
 
@@ -519,14 +518,34 @@ async def update_request_ocr_results(
             {"_id": ObjectId(ocr_id)},
             {"$set": set_fields}
         )
-        updated_docs.append(str(ocr_id))
+
+    # Step 2: Fetch ALL docs (updated + not updated)
+    all_docs = []
+    for doc_type, field_name in {
+        "echs_card": "echs_card_result_id",
+        "referral_letter": "referral_letter_result_id",
+        "aadhar_card": "aadhar_card_result_id"
+    }.items():
+        ocr_id = request_obj.get(field_name)
+        if not ocr_id:
+            continue
+
+        doc = ocr_collection.find_one({"_id": ObjectId(ocr_id)}, {"extracted_data": 1})
+        if doc:
+            all_docs.append({
+                "ocr_id": str(ocr_id),
+                "doc_type": doc_type,
+                "extracted_data": doc.get("extracted_data", {})
+            })
 
     return {
         "status": "success",
-        "updated_count": len(updated_docs),
         "request_id": request_id,
-        "updated_docs": updated_docs
+        "total_docs": len(all_docs),
+        "docs": all_docs
     }
+
+
 
 @app.post("/generate_claim_id")
 def generate_claim_id():
