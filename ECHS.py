@@ -767,3 +767,8 @@ def export_patient_data():
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+@app.get("/prod")
+def get_prod():
+    return {"message": "hello"}
