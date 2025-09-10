@@ -551,7 +551,7 @@ async def update_request_ocr_results(
 def generate_claim_id():
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=False)
             page = browser.new_page()
 
             # Fetch latest referral
