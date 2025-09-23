@@ -1,6 +1,6 @@
 import asyncio
 import sys
-
+import base64, re, traceback
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
@@ -26,7 +26,10 @@ from typing import Optional
 import re
 from playwright.sync_api import sync_playwright
 import traceback
+from fastapi import FastAPI
+from playwright.sync_api import sync_playwright
 
+app = FastAPI()
 load_dotenv()
 
 # MongoDB connection
@@ -76,6 +79,52 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         return user
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+
+
+user_accounts = {
+    "user1": {
+        "username": "parashos",
+        "password": "Paras@123",
+        "polyclinics": ["0147", "0144", "0142", "0143", "0146", "0145", "0431", "0148"]
+    },
+    "user2": {
+        "username": "parasggn",
+        "password": "Paras@123",
+        "polyclinics": ["0149","0150", "0151", "0152","0153", "0154"]
+    }
+}
+
+# --- Center mapping for dropdown values ---
+center_map = {
+    "0147": "5037",
+    "0144": "5036",
+    "0142": "5033",
+    "0143": "5031",
+    "0146": "5038",
+    "0145": "5042",
+    "0431": "5076",
+    "0148": "5043",
+    "0150": "5293",
+    "0151": "5294",
+    "0152": "5290",
+    "0149": "5292",
+    "0153": "5329",
+    "0154": "5296"
+}
+
+
+def get_account_for_poly(poly_id: str):
+    """Return the account details for the given polyclinic"""
+    for acc, details in user_accounts.items():
+        if poly_id in details["polyclinics"]:
+            return details
+    return None
+
+
+
+
+
 
 # Registration
 @app.post("/register")
@@ -167,18 +216,38 @@ async def extract_echs_card(
         file_id = fs.put(contents, filename=file.filename, contentType=file.content_type)
         
         # OCR Prompt
-        prompt = """
-        You are analyzing an ECHS Card. Extract the following fields exactly as seen:
-        - Card No
-        - Patient Name
-        - ESM
-        - DOB
-        - Relationship with ESM
-        There is no separate field called "Patient Name", but it is written on top left.
-        If any field is missing, return "Not Found".
-        Return only valid JSON.
-        """
+        prompt = """You are extracting structured data from an ECHS smart card image. Read all printed and handwritten text and return one JSON object that strictly follows the schema and rules below. No extra keys, comments, or prose. If a value is missing or illegible, output exactly 'Not Found'. Return only JSON.
 
+Schema (key order must be preserved):
+{
+  "Card No": string, // Printed card/reg number on the card face (e.g., 'JB 0000 0268 6390', 'HI 0000 0242 8145'); preserve spaces exactly as shown.
+  "Patient Name": string, // Name at the top-left header; transcribe exactly as printed.
+  "ESM": string, // ESM field is the printed name of the ex-serviceman only; include rank and name exactly as shown (do not include service number here). Look for a specific ESM field on the card. If no separate ESM field exists and the card holder is the ESM themselves, use 'Not Found'.
+  "Relationship with ESM": string, // Relationship term on the card such as 'Spouse', 'Son', 'Daughter', 'Self', etc. If the card holder is the ESM themselves, use 'Self'. If absent or unclear, use 'Not Found'.
+  "DOB": string, // Value labeled 'DOB' (Date of Birth); normalize to DD MMM YYYY format when month is textual (e.g., '01 Jun 1956'); otherwise keep as printed.
+  "DOM": string, // Value labeled 'DOM' (Date of Membership); same normalization rule as DOB; if absent, use 'Not Found'.
+  "Service No": string // Service number of the ESM: prefer a printed value labeled 'Service No'; if not present, use clear handwritten alphanumeric text near the name/photo area that matches common military service number patterns (e.g., 'JC257424Y', 'IC 12345', 'SS-12345'); preserve case, spaces, and hyphens exactly. If both printed and handwritten exist, use the printed one. If none found, use 'Not Found'.
+}
+
+               Extraction rules:
+
+1. ESM Field Logic: Look for a specific 'ESM' field on the card. If the card holder is the ex-serviceman themselves (indicated by military rank in Patient Name), the ESM field may not be separately printed. In such cases, use 'Not Found' for ESM field.
+
+2. Relationship Logic: If the Patient Name contains a military rank (like 'SUB', 'LT', 'COL', etc.), the relationship is typically 'Self'. Otherwise, look for explicit relationship terms.
+
+3. Service Number Identification: Military service numbers typically follow patterns like:
+   - Army: JC######Y, IC#####, SS#####
+   - Navy: Starts with letters followed by numbers
+   - Air Force: Numbers with letter suffix
+   Include only clear, complete service numbers that match these patterns.
+
+4. Text Preservation: Maintain original capitalization, spacing, and punctuation exactly as shown on the card.
+
+5. Date Formatting: Convert dates to DD MMM YYYY format only when the month appears as text (Jan, Feb, etc.). Keep numeric dates as printed.
+
+6. Missing Data: Use 'Not Found' for any field that is not visible, illegible, or clearly absent from the card.
+
+Output must be valid RFC 8259 JSON that parses without errors, with the exact keys and order shown above."""
         data = await run_ocr_prompt(prompt, base64_image)
 
         result = ocr_collection.insert_one({
@@ -265,33 +334,36 @@ async def extract_referral_letter(
         file_id = fs.put(contents, filename=file.filename, contentType=file.content_type)
 
         prompt = """
-        You are analyzing a Referral Letter. Extract:
-        - Polyclinic Name
-        - Name of Patient
-        - Referral No
-        - Valid Upto
-        - Date of Issue
-        - No of Sessions Allowed
-        - Patient Type
-        - Age
-        - Gender
-        - Relationship with ESM
-        - Category
-        - Service No
-        - Card No
-        - ESM Name
-        - ESM Contact Number
-        - Clinical Notes
-        - Admission
-        - Investigation
-        - Consultation For
-        - Polyclinic Remarks
-        - Claim ID
-        If missing, return "Not Found".
-        Don't mix up claim ID and Referral Number.
-        Referral Number is of 14 digits.
-        Return only valid JSON.
-        """
+            You are analyzing a Referral Letter. Extract the fields below exactly as named and return one JSON object that follows the schema and rules strictly. Do not include extra keys, comments, or prose. If any field is missing or illegible, return exactly 'Not Found'. Return only valid JSON.
+Schema (key order fixed):
+{
+"Polyclinic Name": string, // Header showing the Polyclinic name/location; copy as printed.
+"Name of Patient": string, // Field 'Name of Patient'; copy verbatim.
+"Referral No": string, // Exactly a 14-digit numeric string; if not found, 'Not Found'. Do not confuse with Claim ID.
+"Valid Upto": string, // Value labeled 'Validity Upto' or 'Valid Upto'; keep format as printed.
+"Date of Issue": string, // Value labeled 'Date Of Issue'; keep as printed.
+"No of Sessions Allowed": string, // Field 'No. Of Session Allowed'; copy as printed.
+"Patient Type": string, // OPD/IPD etc.; copy as printed.
+"Age": string, // Age value; copy as printed.
+"Gender": string, // Gender value; copy as printed.
+"Relationship with ESM": string, // Relationship with ESM; copy as printed.
+"Category": string, // Category; copy as printed.
+"Service No": string, // Printed 'Service No' only; do not use Referral No or Claim ID here.
+"Card No": string, // 'Card No' value; preserve spacing.
+"ESM Name": string, // 'ESM Name' on the form; copy verbatim.
+"ESM Contact Number": string, // 'ESM Contact Number'; copy digits/spaces exactly.
+"Clinical Notes": string, // 'Clinical Notes' free-text; replace internal newlines with a single space.
+"Admission": string, // 'Admission' field value if present; else 'Not Found'.
+"Investigation": string, // 'Investigation' field value; copy verbatim.
+"Consultation For": string, // 'Consultation For' field value; copy verbatim.
+"Polyclinic Remarks": string, // 'Polyclinic Remarks' field; copy verbatim.
+"Claim ID": string // Value labeled 'Claim ID' only; never use Referral No.
+}
+Rules:
+Referral No vs Claim ID: Referral No is a 14‑digit number printed on the form; Claim ID is generated later by the system—keep them separate.
+Preserve capitalization, punctuation, and spacing exactly as printed for names and numbers; do not reformat dates.
+Choose the value closest to the printed label when multiple candidates appear.
+Output must be RFC 8259 compliant JSON with the exact key names and order above; no comments or trailing commas."""
 
         data = await run_ocr_prompt(prompt, base64_image)
 
@@ -550,19 +622,27 @@ async def update_request_ocr_results(
 @app.post("/generate_claim_id")
 def generate_claim_id():
     try:
+        # --- Fetch latest referral from DB ---
+        referral = ocr_collection.find_one(sort=[("_id", -1)])
+        if not referral:
+            raise Exception("No referral data found in MongoDB!")
+
+        referral_no = referral["extracted_data"]["Referral No"]
+        center_code = referral_no[:4]
+        trimmed_referral = referral_no[4:]
+
+        account = get_account_for_poly(center_code)
+        if not account:
+            raise Exception(f"No account found for polyclinic {center_code}")
+
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=False)
             page = browser.new_page()
 
-            # Fetch latest referral
-            referral = ocr_collection.find_one(sort=[("_id", -1)])
-            if not referral:
-                raise Exception("No referral data found in MongoDB!")
-
-            # Go to login page
+            # --- Login page ---
             page.goto("https://www.echsbpa.utiitsl.com/ECHS/")
-            page.fill("#username", "parashos")
-            page.fill("#password", "Paras@123")
+            page.fill("#username", account["username"])
+            page.fill("#password", account["password"])
 
             # --- CAPTCHA Handling ---
             captcha_selector = "#img_captcha"
@@ -580,14 +660,13 @@ def generate_claim_id():
                     ],
                 }]
             )
-
             captcha_text = response.output_text
             captcha_text = re.sub(r"[^0-9]", "", captcha_text).strip()
             page.fill("#txtCaptcha", captcha_text)
             page.get_by_role("button", name="Sign In").click()
             page.wait_for_timeout(3000)
 
-            # Close popup if exists
+            # --- Close popup if exists ---
             try:
                 popup_selector = 'button:has-text("Close")'
                 if page.locator(popup_selector).is_visible():
@@ -595,65 +674,207 @@ def generate_claim_id():
             except:
                 pass
 
-            # Fill referral data
+            # --- Referral Flow ---
             page.locator("#ihaveseennmi").check()
             page.get_by_role("link", name="Intimation").click()
             page.get_by_role("link", name="Accept Referral").click()
 
-            referral_no = referral["extracted_data"]["Referral No"]
-            center_code = referral_no[:4]
-            trimmed_referral = referral_no[4:]
-
-            center_map = {
-                "0147": "5037",
-                "0144": "5036",
-                "0142": "5033",
-                "0143": "5031",
-                "0146": "5038",
-                "0145": "5042",
-                "0431": "5076",
-                "0148": "5043"
-            }
-
-            if center_code in center_map:
-                page.locator("#referredDispensary").select_option(center_map[center_code])
-            else:
+            if center_code not in center_map:
                 raise Exception(f"Center code {center_code} not mapped!")
 
+            page.locator("#referredDispensary").select_option(center_map[center_code])
             page.locator("(//input[@name='cardnum2'])[1]").fill(trimmed_referral)
             page.locator("(//input[@name='serviceNo'])[1]").fill(referral["extracted_data"]["Service No"])
-
             page.get_by_role("button", name="Search").click()
             page.wait_for_timeout(6000)
 
-            # Extract claim ID from popup
-            popup_selector2 = "#ws_alert_dialog"
+            # --- Check for failure popup ---
+            try:
+                page.locator("#ws_alert_dialog").wait_for(state="visible", timeout=6000)
+                failure_text = page.locator("#ws_alert_dialog #alertpara").inner_text().strip()
+
+                # Save failure message in DB
+                ocr_collection.update_one(
+                    {"_id": referral["_id"]},
+                    {"$set": {"extracted_data.ErrorMessage": failure_text}}
+                )
+                browser.close()
+                return {"status": "error", "message": failure_text}
+            except:
+                pass
+
+            # --- Success Flow ---
+            page.wait_for_selector("input[type='radio'][value='Y']")
+            page.locator("input[type='radio'][value='Y']").check()
+            page.get_by_text('Submit').click()
+            page.wait_for_timeout(3000)
+
+            # --- Extract Claim ID ---
+            popup_selector2 = "#ws_success_dialog"
             page.wait_for_selector(popup_selector2, state="visible")
             popup_text = page.locator(popup_selector2).inner_text()
 
             match = re.search(r"claim id\s*-\s*(\d+)", popup_text, re.IGNORECASE)
             claim_id = match.group(1) if match else None
-
             if not claim_id:
                 raise Exception("Claim ID not found!")
 
-            # Update in MongoDB
+            # Save Claim ID in DB
             ocr_collection.update_one(
                 {"_id": referral["_id"]},
                 {"$set": {"extracted_data.Claim ID": claim_id}}
             )
 
             browser.close()
-
-        return {"status": "success", "claim_id": claim_id}
+            return {"status": "success", "claim_id": claim_id}
 
     except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e) or repr(e),
-            "type": e.__class__.__name__,
-            "traceback": traceback.format_exc()
-        }
+        error_msg = str(e) or repr(e)
+        tb = traceback.format_exc()
+        # Save error in DB
+        ocr_collection.update_one(
+            {"_id": referral["_id"]},
+            {"$set": {"extracted_data.ErrorMessage": error_msg, "Traceback": tb}}
+        )
+        return {"status": "error", "message": error_msg, "traceback": tb}
+
+
+    #Repeate/Follow up
+
+@app.post("/generate_claim_id_followup")
+def generate_claim_id_followup():
+    try:
+        # --- Fetch latest referral from DB ---
+        referral = ocr_collection.find_one(sort=[("_id", -1)])
+        if not referral:
+            raise Exception("No referral data found in MongoDB!")
+
+        referral_no = referral["extracted_data"]["Referral No"]
+        center_code = referral_no[:4]
+
+        account = get_account_for_poly(center_code)
+        if not account:
+            raise Exception(f"No account found for polyclinic {center_code}")
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=False)
+            page = browser.new_page()
+
+            # --- Login page ---
+            page.goto("https://www.echsbpa.utiitsl.com/ECHS/")
+            page.fill("#username", account["username"])
+            page.fill("#password", account["password"])
+
+            # --- CAPTCHA Handling ---
+            captcha_selector = "#img_captcha"
+            page.wait_for_selector(captcha_selector)
+            captcha_buffer = page.locator(captcha_selector).screenshot()
+            base64_image = f"data:image/png;base64,{base64.b64encode(captcha_buffer).decode()}"
+
+            response = client.responses.create(
+                model="gpt-4o-mini",
+                input=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Read the digits from this CAPTCHA image. Only return the numbers."},
+                        {"type": "input_image", "image_url": base64_image}
+                    ],
+                }]
+            )
+            captcha_text = response.output_text
+            captcha_text = re.sub(r"[^0-9]", "", captcha_text).strip()
+            page.fill("#txtCaptcha", captcha_text)
+            page.get_by_role("button", name="Sign In").click()
+            page.wait_for_timeout(3000)
+
+            # --- Close popup if exists ---
+            try:
+                popup_selector = 'button:has-text("Close")'
+                if page.locator(popup_selector).is_visible():
+                    page.click(popup_selector)
+            except:
+                pass
+
+            # --- Followup Flow ---
+            page.locator("#ihaveseennmi").check()
+            page.get_by_role("link", name="Intimation").click()
+            page.get_by_role("link", name="Followup Referral").click()
+
+            # Referral number full (no trimming)
+            refrenceNum = page.locator("#referenceNumber")
+            refrenceNum.fill("01470000526933")
+            # page.locator("(//input[@name='cardnum2'])[1]").fill(referral_no)
+            page.get_by_role("button", name="Submit").click()
+            page.wait_for_timeout(6000)
+
+
+
+            # --- Extract Old Claim ID popup ---
+            old_claim_popup = "#ws_info_dialog"
+            if page.locator(old_claim_popup).is_visible():
+                popup_text = page.locator(f"{old_claim_popup} #infopara").inner_text().strip()
+                match = re.search(r"old claim id\s*-\s*(\d+)", popup_text, re.IGNORECASE)
+                old_claim_id = match.group(1) if match else None
+
+                if old_claim_id:
+                    ocr_collection.update_one(
+                        {"_id": referral["_id"]},
+                        {"$set": {"extracted_data.Old Claim ID": old_claim_id}}
+                    )
+            page.wait_for_timeout(6000)
+                # Close old claim popup
+
+            page.locator("//button[@class='ui-button ui-corner-all ui-widget']").click()    
+            # page.click(f"{old_claim_popup} button:has-text('Close')")
+            page.wait_for_timeout(6000)
+            # --- Select Yes and In-patient ---
+            page.select_option("#confirmAdmit", "Y")
+            page.select_option("select[name='revisitPatientType']", "I")  # In-patient
+            # page.click("input[type='submit']")
+
+            # Accept dialog if appears
+            try:
+                page.on("dialog", lambda dialog: dialog.accept())
+            except:
+                pass
+
+            page.wait_for_timeout(3000)
+
+            # --- Extract New Claim ID popup ---
+            popup_selector2 = "#ws_Success_dialog"
+            page.wait_for_selector(popup_selector2, state="visible")
+            popup_text = page.locator(popup_selector2).inner_text()
+
+            match = re.search(r"claim id\s*-\s*(\d+)", popup_text, re.IGNORECASE)
+            claim_id = match.group(1) if match else None
+            if not claim_id:
+                raise Exception("New Claim ID not found!")
+
+            # Save new Claim ID in DB
+            ocr_collection.update_one(
+                {"_id": referral["_id"]},
+                {"$set": {"extracted_data.Claim ID": claim_id}}
+            )
+
+            browser.close()
+            return {
+                "status": "success",
+                "old_claim_id": old_claim_id if 'old_claim_id' in locals() else None,
+                "new_claim_id": claim_id
+            }
+
+    except Exception as e:
+        error_msg = str(e) or repr(e)
+        tb = traceback.format_exc()
+        try:
+            ocr_collection.update_one(
+                {"_id": referral["_id"]},
+                {"$set": {"extracted_data.ErrorMessage": error_msg, "Traceback": tb}}
+            )
+        except:
+            pass
+        return {"status": "error", "message": error_msg, "traceback": tb}
+
 
 @app.get("/search/{referral_no}")
 def search_referral_letter(
@@ -791,3 +1012,4 @@ def export_patient_data():
 @app.get("/prod")
 def get_prod():
     return {"message": "hello"}
+#
