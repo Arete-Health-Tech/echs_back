@@ -634,9 +634,9 @@ def generate_claim_id():
         account = get_account_for_poly(center_code)
         if not account:
             raise Exception(f"No account found for polyclinic {center_code}")
-
+            is_headless = not os.getenv("DISPLAY")
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False)
+            browser = p.chromium.launch(headless=is_headless)
             page = browser.new_page()
 
             # --- Login page ---
