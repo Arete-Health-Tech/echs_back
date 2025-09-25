@@ -4,6 +4,10 @@ import base64, re, traceback
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
+
+from typing import List
+from PIL import Image
+import io, base64
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
@@ -386,6 +390,117 @@ Output must be RFC 8259 compliant JSON with the exact key names and order above;
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+
+@app.post("/extract/prescription")
+
+async def extract_prescription(
+    files: List[UploadFile] = File(...),
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        # Validate
+        if not files or len(files) > 2:
+            raise HTTPException(status_code=400, detail="Upload 1–2 images")
+
+        # Save originals to GridFS and collect bytes
+        contents, file_ids = [], []
+        for f in files:
+            b = await f.read()
+            contents.append(b)
+            file_ids.append(str(fs.put(b, filename=f.filename, contentType=f.content_type)))
+
+        # Merge-if-two, else use single
+        if len(contents) == 1:
+            final_bytes = contents[0]
+        else:
+            from PIL import Image
+            import io
+            imgs = [Image.open(io.BytesIO(b)).convert("RGB") for b in contents]
+            w = max(i.width for i in imgs)
+            imgs = [i if i.width == w else i.resize((w, int(i.height * w / i.width))) for i in imgs]
+            h = sum(i.height for i in imgs)
+            can = Image.new("RGB", (w, h), "white")
+            y = 0
+            for i in imgs:
+                can.paste(i, (0, y)); y += i.height
+            buf = io.BytesIO()
+            can.save(buf, "JPEG", quality=90)
+            final_bytes = buf.getvalue()
+
+        # Final base64 for OCR
+        base64_image = base64.b64encode(final_bytes).decode("utf-8")
+
+
+
+        # 🔹 Prompt for Prescription with Admission Advice
+        prompt = """
+            Please analyze the attached medical prescription image and extract the following information in JSON format:
+
+*Required Fields:*
+1. *name*: Patient's full name as written on prescription
+2. *age*: Patient's age (if mentioned, otherwise "Not specified")
+3. *diagnosis*: Complete diagnosis including stage, biomarkers, and date if available
+4. *advice*: Doctor's recommendations and instructions for treatment
+5. *medication*: Array of objects with "name" and "dosage" for each prescribed medication
+6. *treatment_plan*: Array of treatment steps, monitoring plans, and clinical assessments
+
+*Instructions:*
+- Extract information exactly as written, preserving medical terminology
+- For medications, include both generic and brand names if available
+- Include dosage with units (mg, ml, IV, etc.)
+- For diagnosis, include staging, molecular markers, and dates
+- Treatment plan should include ongoing therapy, monitoring, and follow-up instructions
+- If information is unclear or missing, indicate "Not specified" or "Unclear from prescription"
+
+*Output Format:*
+Return data as a clean JSON object with the exact structure shown above.
+
+*Example Output Structure:*
+{
+  "name": "Patient Full Name",
+  "age": "Age or 'Not specified'",
+  "diagnosis": "Complete diagnosis with staging and dates",
+  "advice": "Doctor's advice and instructions",
+  "medication": [
+    { "name": "Drug Name", "dosage": "Amount with units" }
+  ],
+  "treatment_plan": [
+    "Treatment step 1",
+    "Monitoring requirement",
+    "Follow-up instruction"
+  ]
+}
+
+        """
+
+        # OCR + LLM extraction
+        data = await run_ocr_prompt(prompt, base64_image)
+
+        # Save result to MongoDB
+        result = ocr_collection.insert_one({
+            "user_id": str(current_user["_id"]),
+            "doc_type": "prescription",
+            "image_file_id": file_ids,
+            "extracted_data": data,
+            "uploaded_at": datetime.utcnow()
+        })
+
+        return {
+            "status": "success",
+            "doc_type": "prescription",
+            "ocr_result_id": str(result.inserted_id),
+            # "image_file_id": str(file_id),
+            "image_file_id": file_ids if len(file_ids) > 1 else file_ids[0],
+            "data": data
+        }
+ 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
 # ---------- 3. Aadhar Card Extraction ----------
 @app.post("/extract/aadhar_card")
 async def extract_aadhar_card(
@@ -473,6 +588,7 @@ class FinalSubmissionRequest(BaseModel):
     echs_card_result_id: Optional[str] = None
     referral_letter_result_id: Optional[str] = None
     aadhar_card_result_id: Optional[str] = None
+    prescription_result_id: Optional[str] = None
     
 class SubmitRequestPayload(BaseModel):
     matched: Optional[bool] = None
@@ -493,7 +609,12 @@ def submit_request(payload: SubmitRequestPayload, current_user: dict = Depends(g
         sort=[("_id", -1)]
     )
 
-    if not (echs_or_slip or referral or aadhar):
+    prescription = ocr_collection.find_one(
+        {"user_id": str(current_user["_id"]), "doc_type": "prescription"},
+        sort=[("_id", -1)]
+    )
+
+    if not (echs_or_slip or referral or aadhar or prescription):
         raise HTTPException(status_code=400, detail="No documents found for submission")
 
     request_doc = {
@@ -501,6 +622,7 @@ def submit_request(payload: SubmitRequestPayload, current_user: dict = Depends(g
         "echs_card_result_id": str(echs_or_slip["_id"]) if echs_or_slip else None,
         "referral_letter_result_id": str(referral["_id"]) if referral else None,
         "aadhar_card_result_id": str(aadhar["_id"]) if aadhar else None,
+        "prescription_result_id": str(prescription["_id"]) if prescription else None,
         "matched": payload.matched,
         "created_at": datetime.utcnow()
     }
@@ -577,6 +699,8 @@ async def update_request_ocr_results(
             ocr_id = request_obj.get("referral_letter_result_id")
         elif doc_type == "aadhar_card":
             ocr_id = request_obj.get("aadhar_card_result_id")
+        elif doc_type == "prescription":
+            ocr_id = request_obj.get("prescription_result_id")
         else:
             continue
 
@@ -593,11 +717,15 @@ async def update_request_ocr_results(
 
     # Step 2: Fetch ALL docs (updated + not updated)
     all_docs = []
-    for doc_type, field_name in {
+
+    mapping = {
         "echs_card": "echs_card_result_id",
         "referral_letter": "referral_letter_result_id",
-        "aadhar_card": "aadhar_card_result_id"
-    }.items():
+        "aadhar_card": "aadhar_card_result_id",
+        "prescription": "prescription_result_id"
+    }
+
+    for doc_type, field_name in mapping.items():
         ocr_id = request_obj.get(field_name)
         if not ocr_id:
             continue
