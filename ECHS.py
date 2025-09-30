@@ -747,24 +747,46 @@ async def update_request_ocr_results(
 
 
 
+
+
+
+
+
 @app.post("/generate_claim_id")
 def generate_claim_id():
     try:
         # --- Fetch latest referral from DB ---
-        referral = ocr_collection.find_one(sort=[("_id", -1)])
+        # referral = ocr_collection.find_one(sort=[("_id", -1)])
+
+        referral = ocr_collection.find_one(
+            {"extracted_data.Referral No": {"$exists": True}}, 
+            sort=[("_id", -1)]
+            
+        )
+        
+
+
         if not referral:
             raise Exception("No referral data found in MongoDB!")
 
+
+
         referral_no = referral["extracted_data"]["Referral No"]
+
+        # extracted_data = referral.get("extracted_data", {})
+
+
         center_code = referral_no[:4]
         trimmed_referral = referral_no[4:]
+
+
 
         account = get_account_for_poly(center_code)
         if not account:
             raise Exception(f"No account found for polyclinic {center_code}")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=False)
             page = browser.new_page()
 
             # --- Login page ---
@@ -867,6 +889,13 @@ def generate_claim_id():
         return {"status": "error", "message": error_msg, "traceback": tb}
 
 
+
+
+
+
+
+
+
     #Repeate/Follow up
 
 @app.post("/generate_claim_id_followup")
@@ -885,7 +914,7 @@ def generate_claim_id_followup():
             raise Exception(f"No account found for polyclinic {center_code}")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False)
+            browser = p.chromium.launch(headless=True)
             page = browser.new_page()
 
             # --- Login page ---
@@ -959,6 +988,7 @@ def generate_claim_id_followup():
             page.select_option("#confirmAdmit", "Y")
             page.select_option("select[name='revisitPatientType']", "I")  # In-patient
             # page.click("input[type='submit']")
+            page.get_by_role("button", name="Submit").click()
 
             # Accept dialog if appears
             try:
@@ -1067,6 +1097,7 @@ def get_user_history(user_id: str):
             attach_ocr_data("echs_card_result_id", "echs_card_or_temporary_slip")
             attach_ocr_data("referral_letter_result_id", "referral_letter")
             attach_ocr_data("aadhar_card_result_id", "aadhar_card")
+            attach_ocr_data("prescription_result_id", "prescription")
 
         return {
             "status": "success",
