@@ -5,6 +5,15 @@ if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+from pymongo import MongoClient
+import pandas as pd
+import ssl
+
+
+
 from typing import List
 from PIL import Image
 import io, base64
@@ -275,7 +284,7 @@ Output must be valid RFC 8259 JSON that parses without errors, with the exact ke
 
 @app.post("/extract/temporary_slip")
 async def extract_temporary_slip(
-    file: UploadFile = File(None),
+    file: UploadFile = File(None), #when testing postman file name should same (when get err 500 )
     current_user: dict = Depends(get_current_user)
 ):
     try:
@@ -288,19 +297,46 @@ async def extract_temporary_slip(
         
         # OCR Prompt
         prompt = """
-        You are analyzing a temporary slip, which is given if ECHS Card is not present. Extract the following fields exactly as seen:
-        - Form No
-        - Temporary Slip No
-        - Patient Name
-        - ESM
-        - DOB
-        - Relationship with ESM
-        - Category
-        - Valid Upto
-        - Category of Ward
-        There is no separate field called "Patient Name".
-        If any field is missing, return "Not Found".
-        Return only valid JSON.
+                You are analyzing an ECHS temporary receipt document. Extract ONLY these 8 fields exactly as seen:
+
+EXTRACTION RULES:
+1. Form No: Extract pattern like "730138F" - 6-7 digits followed by single letter (F, H, B, etc.). Located in "Received documents from No [FORM_NO]" section.
+
+2. Registration No: Extract 10-digit number like "0002065787" from "Registration No :" field.
+
+3. Patient Name: Extract dependent's name from photo section (Son/Daughter/Spouse name).
+
+4. ESM: Extract Ex-Serviceman's name from "Rank [RANK] Name [ESM_NAME]" section.
+
+5. DOB: Extract dependent's date of birth from photo section in DD Mon YYYY format.
+
+6. Relationship with ESM: Extract relationship (Son/Daughter/Spouse) from photo section.
+
+7. Valid Upto: Extract validity date (may be handwritten).
+
+8. Category of Ward: Extract ward category (Semi-Private/General/Other).
+
+SPECIFIC PATTERNS:
+- Form No: [digits][letter] like "730138F", "145644H"  
+- Registration No: 10-digit number like "0002065787"
+- Dates: DD Mon YYYY format (01 Jun 1967, 06 Jan 1997)
+
+OUTPUT FORMAT:
+{
+    "form_no": "",
+    "registration_no": "", 
+    "patient_name": "",
+    "esm": "",
+    "dob": "",
+    "relationship_with_esm": "",
+    "valid_upto": "",
+    "category_of_ward": ""
+}
+
+If any field is not found or unclear, use "Not Found" as the value.
+Return only valid JSON with these exact 8 fields.
+
+
         """
 
         data = await run_ocr_prompt(prompt, base64_image)
@@ -338,36 +374,116 @@ async def extract_referral_letter(
         file_id = fs.put(contents, filename=file.filename, contentType=file.content_type)
 
         prompt = """
-            You are analyzing a Referral Letter. Extract the fields below exactly as named and return one JSON object that follows the schema and rules strictly. Do not include extra keys, comments, or prose. If any field is missing or illegible, return exactly 'Not Found'. Return only valid JSON.
+You are analyzing a Referral Letter. CRITICAL: You have been making consistent errors with specific fields and characters. Follow these rules exactly.
+
+KNOWN ERROR PATTERNS TO AVOID:
+1. REFERRAL NO ERROR: You frequently read "01440000402039" as "01440000402319" 
+   - This happens because you insert an extra "1" and change "0" to "3"
+   - The pattern "...402039" should NEVER become "...402319"
+   - If you see 15+ digits, you've made a segmentation error
+
+2. SERVICE NO ERROR: You sometimes confuse Service No with other numbers
+   - Service No format: 8-10 digits + 1 letter (e.g., "477762440Y")
+   - Do NOT use Contact Numbers, Card Numbers, or Referral Numbers
+
+3. AGE/DECIMAL POINT ERROR: You read decimal points as letters
+   - "52.8" becomes "52 B" - WRONG
+   - "45.5" becomes "45 S" - WRONG  
+   - "38.2" becomes "38 Z" - WRONG
+   - Pattern: [number].[digit] should NEVER become [number] [letter]
+
+CHARACTER RECOGNITION RULES:
+Pay special attention to these character confusions:
+- Decimal point (.) vs letter B, S, 8, O
+- Number 0 (zero) vs letter O
+- Number 1 vs letter I or l
+- Number 5 vs letter S
+- Number 6 vs letter G or 9
+- Number 8 vs letter B
+- Number 2 vs letter Z
+
+DECIMAL NUMBER DETECTION:
+- If you see [digit][space][letter] pattern in numeric fields, it's likely a decimal point error
+- Example: "52 B" should be "52.8", "45 S" should be "45.5"
+- Context check: Age, measurements, scores are often decimals, not "number + letter"
+
+CRITICAL EXTRACTION RULES:
+- Referral No: Must be EXACTLY 14 digits from field labeled 'Referral No'
+- Service No: Must be digits+letter from field labeled 'Service No' 
+- Age: Should be numeric (can include decimals), not "number + letter"
+- Read each character individually to prevent segmentation/recognition errors
+- For numeric fields, verify decimal points aren't read as letters
+
+FIELD-SPECIFIC INSTRUCTIONS:
+Referral No: After extraction, double-check positions 11-14. If you see "2319" at end, it's likely wrong - should be "2039"
+Service No: Look for explicit 'Service No' label, usually ends with Y, X, A, or similar letter
+Age: Should be purely numeric (e.g., "52.8", "45", "62.5") - if you see "52 B", it should be "52.8"
+Clinical Notes: Extract ONLY from 'Clinical Notes' section - never mix with Admission data
+Admission: Extract ONLY from 'Admission' section - never use Clinical Notes data
+Investigation: Extract ONLY from 'Investigation' section
+Referred To: Extract ONLY from 'Referred To' section
+
+Extract the fields below exactly as named and return one JSON object that follows the schema and rules strictly. Do not include extra keys, comments, or prose. If any field is missing or illegible, return exactly 'Not Found'. Return only valid JSON.
+
 Schema (key order fixed):
 {
 "Polyclinic Name": string, // Header showing the Polyclinic name/location; copy as printed.
 "Name of Patient": string, // Field 'Name of Patient'; copy verbatim.
-"Referral No": string, // Exactly a 14-digit numeric string; if not found, 'Not Found'. Do not confuse with Claim ID.
+"Referral No": string, // CRITICAL: 14-digit number only. Check for "402319" error pattern.
 "Valid Upto": string, // Value labeled 'Validity Upto' or 'Valid Upto'; keep format as printed.
 "Date of Issue": string, // Value labeled 'Date Of Issue'; keep as printed.
 "No of Sessions Allowed": string, // Field 'No. Of Session Allowed'; copy as printed.
 "Patient Type": string, // OPD/IPD etc.; copy as printed.
-"Age": string, // Age value; copy as printed.
+"Age": string, // CRITICAL: Numeric only (can have decimals). If you see "52 B" it should be "52.8".
 "Gender": string, // Gender value; copy as printed.
 "Relationship with ESM": string, // Relationship with ESM; copy as printed.
 "Category": string, // Category; copy as printed.
-"Service No": string, // Printed 'Service No' only; do not use Referral No or Claim ID here.
+"Service No": string, // CRITICAL: From 'Service No' field only. Format: digits+letter.
 "Card No": string, // 'Card No' value; preserve spacing.
 "ESM Name": string, // 'ESM Name' on the form; copy verbatim.
 "ESM Contact Number": string, // 'ESM Contact Number'; copy digits/spaces exactly.
-"Clinical Notes": string, // 'Clinical Notes' free-text; replace internal newlines with a single space.
-"Admission": string, // 'Admission' field value if present; else 'Not Found'.
-"Investigation": string, // 'Investigation' field value; copy verbatim.
+"Clinical Notes": string, // 'Clinical Notes' section ONLY; replace internal newlines with single space.
+"Referred To": string, // 'Referred To' section ONLY; copy verbatim.
+"Admission": string, // 'Admission' section ONLY; never use Clinical Notes data here.
+"Investigation": string, // 'Investigation' section ONLY; copy verbatim.
 "Consultation For": string, // 'Consultation For' field value; copy verbatim.
 "Polyclinic Remarks": string, // 'Polyclinic Remarks' field; copy verbatim.
 "Claim ID": string // Value labeled 'Claim ID' only; never use Referral No.
 }
+
+VALIDATION STEPS:
+1. After extracting Referral No, count digits (must be exactly 14)
+2. Check for known error pattern "402319" - should be "402039"
+3. Verify Service No has digits+letter format from correct field
+4. Check Age field - if format is "number letter" (e.g., "52 B"), convert to decimal (e.g., "52.8")
+5. Ensure no data mixing between Clinical Notes and Admission fields
+6. For any numeric fields showing "number + single letter", check if it should be decimal
+
+DECIMAL POINT CORRECTIONS:
+- "52 B" → "52.8"
+- "45 S" → "45.5" 
+- "38 Z" → "38.2"
+- "67 G" → "67.6"
+- Pattern: If numeric field shows [digit][space][letter], likely decimal point error
+
+FINAL CHECK:
+- Referral No: Exactly 14 digits, check end digits for "2039" vs "2319" error
+- Service No: From Service No field only, ends with letter
+- Age: Numeric format only (no letters unless it's actually part of age like "52 years")
+- Field Separation: No mixing of Clinical Notes with Admission data
+- Character Count: If numbers have wrong digit count, mark as 'Not Found'
+- Decimal Recognition: Convert "number letter" patterns to "number.digit" in numeric fields
+
 Rules:
-Referral No vs Claim ID: Referral No is a 14‑digit number printed on the form; Claim ID is generated later by the system—keep them separate.
-Preserve capitalization, punctuation, and spacing exactly as printed for names and numbers; do not reformat dates.
-Choose the value closest to the printed label when multiple candidates appear.
-Output must be RFC 8259 compliant JSON with the exact key names and order above; no comments or trailing commas."""
+1. FIELD ISOLATION: Extract each field ONLY from its specifically labeled section
+2. ERROR PATTERN PREVENTION: Watch for known "402319" vs "402039" confusion
+3. DECIMAL POINT ACCURACY: Recognize when dots are misread as letters in numeric fields
+4. CHARACTER PRECISION: Read digits individually to prevent segmentation errors
+5. DATA INTEGRITY: Never mix content between different labeled sections
+6. NUMERIC VALIDATION: Ensure numeric fields contain proper numbers, not "number + letter"
+7. Output must be RFC 8259 compliant JSON with exact key names and order above; no comments or trailing commas.
+
+           """
 
         data = await run_ocr_prompt(prompt, base64_image)
 
@@ -435,44 +551,75 @@ async def extract_prescription(
 
         # 🔹 Prompt for Prescription with Admission Advice
         prompt = """
-            Please analyze the attached medical prescription image and extract the following information in JSON format:
+Task: Analyze the attached medical prescription(s) and extract structured data as JSON.
 
-*Required Fields:*
-1. *name*: Patient's full name as written on prescription
-2. *age*: Patient's age (if mentioned, otherwise "Not specified")
-3. *diagnosis*: Complete diagnosis including stage, biomarkers, and date if available
-4. *advice*: Doctor's recommendations and instructions for treatment
-5. *medication*: Array of objects with "name" and "dosage" for each prescribed medication
-6. *treatment_plan*: Array of treatment steps, monitoring plans, and clinical assessments
 
-*Instructions:*
-- Extract information exactly as written, preserving medical terminology
-- For medications, include both generic and brand names if available
-- Include dosage with units (mg, ml, IV, etc.)
-- For diagnosis, include staging, molecular markers, and dates
-- Treatment plan should include ongoing therapy, monitoring, and follow-up instructions
-- If information is unclear or missing, indicate "Not specified" or "Unclear from prescription"
+Inputs:
 
-*Output Format:*
-Return data as a clean JSON object with the exact structure shown above.
 
-*Example Output Structure:*
+One or two images may be provided (Prescription Page 1 and optionally Page 2). Treat them as parts of the same encounter. If only one image exists, proceed with that page. If two images exist, merge information across both pages and resolve duplicates consistently (prefer the more explicit entry; if still uncertain, mark as ‘Unclear from prescription’).
+
+
+Output JSON schema (return exactly these keys):
 {
-  "name": "Patient Full Name",
-  "age": "Age or 'Not specified'",
-  "diagnosis": "Complete diagnosis with staging and dates",
-  "advice": "Doctor's advice and instructions",
-  "medication": [
-    { "name": "Drug Name", "dosage": "Amount with units" }
-  ],
-  "treatment_plan": [
-    "Treatment step 1",
-    "Monitoring requirement",
-    "Follow-up instruction"
-  ]
+"name": "Patient Full Name or 'Not specified'",
+"age": "Age (with units if written) or 'Not specified'",
+"diagnosis": "Complete diagnosis with staging, biomarkers, and dates exactly as written, or 'Not specified'",
+"advice": "Doctor’s advice/instructions verbatim (summarize multi-line text into one string) or 'Not specified'",
+"medication": [
+{ "name": "Drug or brand (include generic if both appear)", "dosage": "Exact strength + route + frequency + duration, e.g., 'paclitaxel 100 mg IV D1' or 'syp Apivite 10 ml BD 30 days'" }
+],
+"treatment_plan": [
+"Step 1 or plan item (e.g., 'CT-RT weekly concurrent chemo')",
+"Monitoring/assessments (e.g., 'Order PDL-1 on tumour tissue; NGS 12-gene panel')",
+"Follow-up instruction (e.g., 'Re-admit to day care after cardiology review')"
+],
+"gender": "Gender as written or 'Not specified'"
 }
 
-        """
+
+Extraction rules:
+
+
+Preserve original medical terminology, capitalization, drug names, and abbreviations (CT-RT, D1, BD, IV, etc.).
+
+
+Combine information from both pages; do not duplicate identical items.
+
+
+For diagnosis, include stage, histology, site, laterality, biomarkers (e.g., PDL-1), and date on the prescription if present.
+
+
+For medication, include each distinct item (injections, tablets, syrups) with exact dose, route, schedule, and duration when specified.
+
+
+For treatment_plan, list therapy steps, investigations, monitoring, referrals (e.g., cardiology review), and sequencing (e.g., ‘then give …’).
+
+
+If a required value is missing or unreadable, return 'Not specified' or 'Unclear from prescription' (do not infer).
+
+
+Strip personally identifying numbers except those explicitly part of medical orders (e.g., “PDL-1”, “12 gene panel”).
+
+
+Return only the JSON object, no extra commentary or Markdown.
+
+
+Edge cases:
+
+
+Handwritten ambiguity: prefer exact tokens; if multiple interpretations exist, choose the clearest and note others in parentheses or mark as ‘Unclear from prescription’.
+
+
+Units: keep units as written (mg, ml, %, tabs, IV, SC, OD, BD, TID, HS, weekly, D1, D8, etc.).
+
+
+Dates: include the written date(s) in ISO format if clear, else keep as seen (e.g., ‘29/9/25’).
+
+
+Now read the provided Prescription Page 1 and, if present, Page 2, apply the rules above, and output the single JSON object.
+i want to extract gender also / add one more text field is gender that extract gender refer attacted prescription so give me optimized prompt that able to extract gender also - iam giving my current promt not change other but add for gender. i want to extract majorly is what is doctor advised to patient, or what treatment advised / admission or any  that should extract proprly
+"""
 
         # OCR + LLM extraction
         data = await run_ocr_prompt(prompt, base64_image)
@@ -901,8 +1048,14 @@ def generate_claim_id():
 @app.post("/generate_claim_id_followup")
 def generate_claim_id_followup():
     try:
-        # --- Fetch latest referral from DB ---
-        referral = ocr_collection.find_one(sort=[("_id", -1)])
+        # --- Fetch  referral from DB ---
+        # referral = ocr_collection.find_one(sort=[("_id", -1)])
+        referral = ocr_collection.find_one(
+            {"extracted_data.Referral No": {"$exists": True}}, 
+            sort=[("_id", -1)]
+            
+        )
+
         if not referral:
             raise Exception("No referral data found in MongoDB!")
 
@@ -914,7 +1067,7 @@ def generate_claim_id_followup():
             raise Exception(f"No account found for polyclinic {center_code}")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=False)
             page = browser.new_page()
 
             # --- Login page ---
@@ -959,8 +1112,8 @@ def generate_claim_id_followup():
 
             # Referral number full (no trimming)
             refrenceNum = page.locator("#referenceNumber")
-            refrenceNum.fill("01470000526933")
-            # page.locator("(//input[@name='cardnum2'])[1]").fill(referral_no)
+            # refrenceNum.fill("04310000092695")
+            page.locator("(//input[@name='cardnum2'])[1]").fill(referral_no)
             page.get_by_role("button", name="Submit").click()
             page.wait_for_timeout(6000)
 
@@ -987,14 +1140,38 @@ def generate_claim_id_followup():
             # --- Select Yes and In-patient ---
             page.select_option("#confirmAdmit", "Y")
             page.select_option("select[name='revisitPatientType']", "I")  # In-patient
-            # page.click("input[type='submit']")
-            page.get_by_role("button", name="Submit").click()
+            page.wait_for_timeout(3000)
 
-            # Accept dialog if appears
+
+
+            # Handle confirmation dialog (OK button)
+            page.once("dialog", lambda dialog: dialog.accept())
+
+            # Click the submit button (triggers popup)
+            # page.click("button#submit")   # <-- replace with your locator
             try:
-                page.on("dialog", lambda dialog: dialog.accept())
-            except:
-                pass
+        # First attempt: standard button locator
+               page.get_by_role("button", name="Submit").click(timeout=5000)
+               print("Clicked using first locator")
+            except TimeoutError:
+                try:
+            # Second attempt: using section or text locator as fallback
+                    section = page.locator("section#form-section")  # example section
+                    section.locator("text=Submit").click(timeout=5000)
+                    print("Clicked using section locator fallback")
+                except TimeoutError:
+                    print("Failed to click the Submit button using both locators")
+
+            # page.locator("//input[@onclick='return validateRepeat();'']").click()
+            # page.get_by_role("button", name="Submit").click()
+
+
+            # page.wait_for_timeout(3000)
+            # Accept dialog if appears
+            # try:
+            #     page.on("dialog", lambda dialog: dialog.accept())
+            # except:
+            #     pass
 
             page.wait_for_timeout(3000)
 
@@ -1008,7 +1185,7 @@ def generate_claim_id_followup():
             if not claim_id:
                 raise Exception("New Claim ID not found!")
 
-            # Save new Claim ID in DB
+            # Save new Claim ID in DB    # update here code for new claim id 
             ocr_collection.update_one(
                 {"_id": referral["_id"]},
                 {"$set": {"extracted_data.Claim ID": claim_id}}
@@ -1167,6 +1344,57 @@ def export_patient_data():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
+
+
+app = FastAPI()
+@app.get("/echs_data")
+def echs_data(limit: int | None = None):
+        # MongoDB connection string
+    CONNECTION_STRING = "mongodb+srv://pilot:pilot@cluster1.rkupr.mongodb.net/?retryWrites=true&w=majority"
+
+    # Connect to MongoDB
+    client = MongoClient(CONNECTION_STRING)
+
+    try:
+        # Print available databases and collections
+        print("Databases:", client.list_database_names())
+        db = client.hospital_app
+        print("Collections in hospital_app:", db.list_collection_names())
+
+        # Load collections
+        df = pd.DataFrame(list(db["ocr_results"].find()))
+        df2 = pd.DataFrame(list(db["fs.files"].find()))
+        df1 = pd.DataFrame(list(db["requests_history"].find()))
+
+    finally:
+        client.close()
+        print("MongoDB connection closed.")
+        print("", df.shape)
+        print("", df2.shape)
+        print("", df1.shape)
+    df1['echs_card_result_id'] = df1['echs_card_result_id'].astype(str)
+    df1['referral_letter_result_id'] = df1['referral_letter_result_id'].astype(str)
+    df1['prescription_result_id'] = df1['prescription_result_id'].astype(str)
+    df['_id'] = df['_id'].astype(str)
+    main_df = df1[["echs_card_result_id","referral_letter_result_id","prescription_result_id"]].drop_duplicates()
+    last_df = pd.merge(main_df, df, left_on='echs_card_result_id',right_on='_id', how='inner')
+    last_df = last_df.rename(columns={'extracted_data': 'echs_data','doc_type':'echs_card'})
+    last_df = pd.merge(last_df, df, left_on='referral_letter_result_id',right_on='_id', how='inner')
+    last_df = last_df.rename(columns={'extracted_data': 'referral_letter_data','doc_type':'referral_letter','uploaded_at_x':'echs_upload_date','uploaded_at_y':'refferal_upload_date','image_file_id_x':'echs_image_id','image_file_id_y':'refferal_image_id',})
+    final = last_df[['echs_image_id','echs_upload_date','echs_data','refferal_image_id'	,'referral_letter_data'	,'refferal_upload_date']]
+    df3 = df2[['filename','_id']]
+    final = pd.merge(final, df3, left_on='echs_image_id',right_on='_id', how='inner')
+    final = pd.merge(final, df3, left_on='refferal_image_id',right_on='_id', how='inner')
+    final = final.rename(columns = {'filename_x' : 'echs_img','filename_y' : 'refferal_img'})
+    final = final[['echs_upload_date','echs_data','referral_letter_data'	,'refferal_upload_date','echs_img','refferal_img']]
+
+    result = final.to_dict(orient='records')
+    return {"echs_data": result}
+
+
+
+
+
 
 @app.get("/prod")
 def get_prod():
