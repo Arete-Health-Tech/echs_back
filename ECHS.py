@@ -1346,7 +1346,7 @@ def export_patient_data():
     
 
 
-app = FastAPI()
+
 @app.get("/echs_data")
 def echs_data(limit: int | None = None):
         # MongoDB connection string
