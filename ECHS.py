@@ -323,14 +323,14 @@ SPECIFIC PATTERNS:
 
 OUTPUT FORMAT:
 {
-    "form_no": "",
-    "registration_no": "", 
-    "patient_name": "",
-    "esm": "",
-    "dob": "",
-    "relationship_with_esm": "",
-    "valid_upto": "",
-    "category_of_ward": ""
+    "Form No": "",
+    "Registration No": "", 
+    "Patient Name": "",
+    "ESM": "",
+    "DOB": "",
+    "Relationship With Esm": "",
+    "Valid Upto": "",
+    "Category of Ward": ""
 }
 
 If any field is not found or unclear, use "Not Found" as the value.
@@ -933,7 +933,7 @@ def generate_claim_id():
             raise Exception(f"No account found for polyclinic {center_code}")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=False)
             page = browser.new_page()
 
             # --- Login page ---
@@ -1111,9 +1111,8 @@ def generate_claim_id_followup():
             page.get_by_role("link", name="Followup Referral").click()
 
             # Referral number full (no trimming)
-            refrenceNum = page.locator("#referenceNumber")
-            # refrenceNum.fill("04310000092695")
-            page.locator("(//input[@name='cardnum2'])[1]").fill(referral_no)
+            page.locator("#referenceNumber").fill(referral_no)
+            
             page.get_by_role("button", name="Submit").click()
             page.wait_for_timeout(6000)
 
@@ -1174,6 +1173,7 @@ def generate_claim_id_followup():
             #     pass
 
             page.wait_for_timeout(3000)
+
 
             # --- Extract New Claim ID popup ---
             popup_selector2 = "#ws_Success_dialog"
