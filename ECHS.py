@@ -1348,7 +1348,7 @@ def export_patient_data():
 
 
 @app.get("/echs_data")
-def echs_data(limit: int | None = None):
+def echs_data(limit:Optional[int]=None):
         # MongoDB connection string
     CONNECTION_STRING = "mongodb+srv://pilot:pilot@cluster1.rkupr.mongodb.net/?retryWrites=true&w=majority"
 
