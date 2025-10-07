@@ -98,7 +98,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 user_accounts = {
     "user1": {
         "username": "parashos",
-        "password": "Paras@12",
+        "password": "Paras@123",
         "polyclinics": ["0147", "0144", "0142", "0143", "0146", "0145", "0431", "0148"]
     },
     "user2": {
