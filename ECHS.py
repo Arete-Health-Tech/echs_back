@@ -98,12 +98,12 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 user_accounts = {
     "user1": {
         "username": "parashos",
-        "password": "Paras@123",
+        "password": "Paras@12",
         "polyclinics": ["0147", "0144", "0142", "0143", "0146", "0145", "0431", "0148"]
     },
     "user2": {
         "username": "parasggn",
-        "password": "Paras@123",
+        "password": "Paras@12",
         "polyclinics": ["0149","0150", "0151", "0152","0153", "0154"]
     }
 }
@@ -1067,7 +1067,7 @@ def generate_claim_id_followup():
             raise Exception(f"No account found for polyclinic {center_code}")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=False)
             page = browser.new_page()
 
             # --- Login page ---
