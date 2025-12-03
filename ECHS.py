@@ -4,9 +4,19 @@ import base64, re, traceback
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import Error as PlaywrightError
 
 
-from fastapi import FastAPI
+import boto3
+# from pymongo import MongoClient
+import gridfs
+# from bson import ObjectId
+from io import BytesIO
+from datetime import timedelta
+from fastapi import BackgroundTasks 
+
+# from fastapi import FastAPI
 from pydantic import BaseModel
 from pymongo import MongoClient
 import pandas as pd
@@ -28,7 +38,7 @@ from jose import jwt, JWTError
 from datetime import datetime, timedelta
 from bson import ObjectId
 from openai import OpenAI
-import base64
+# import base64
 import json
 import os
 import pandas as pd
@@ -42,7 +52,14 @@ import traceback
 from fastapi import FastAPI
 from playwright.sync_api import sync_playwright
 
-app = FastAPI()
+# from datetime import datetime
+import pytz
+# IST = pytz.timezone("Asia/Kolkata")  # ✅ reusable IST timezone object
+
+import fitz
+
+
+# app = FastAPI()
 load_dotenv()
 
 # MongoDB connection
@@ -60,6 +77,99 @@ ALGORITHM = "HS256"
 
 # OAuth2 scheme
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+
+
+
+
+
+# db1 = client_mongo[os.getenv("MONGO_NAME")]
+fs = gridfs.GridFS(db)
+
+# --- AWS S3 connection ---
+# s3_client = boto3.client(
+#     's3',
+#     aws_access_key_id='',
+#     aws_secret_access_key='',
+#     region_name='ap-south-1'
+# )
+
+# bucket_name = 'echsimg'
+
+# def upload_latest_to_s3():
+#     """Function to upload latest OCR records to S3 - can be called anytime"""
+    
+#     # --- Step 1: Get the latest OCR record by uploaded_at ---
+#     latest_ocr = db.ocr_results.find_one(sort=[("uploaded_at", -1)])
+
+#     if not latest_ocr:
+#         print("No OCR records found.")
+#         return  # Return instead of exit()
+
+#     latest_time = latest_ocr["uploaded_at"]
+#     print(f"📅 Latest uploaded_at: {latest_time}")
+
+#     # --- Step 2: Find all OCR records in the same batch (±30 seconds window) ---
+#     time_window = timedelta(seconds=30)
+#     start_time = latest_time - time_window
+#     end_time = latest_time + time_window
+
+#     latest_batch = list(db.ocr_results.find({
+#         "uploaded_at": {"$gte": start_time, "$lte": end_time}
+#     }).sort("uploaded_at", 1))
+
+#     print(f"Found {len(latest_batch)} OCR record(s) in the latest batch.")
+
+#     # --- Step 3: Upload each image to S3 using doc_type ---
+#     for ocr_doc in latest_batch:
+#         image_ids = ocr_doc.get("image_file_id", [])  # Use .get() to avoid KeyError
+#         content_type = "image/jpeg"
+
+#         # Use doc_type from OCR document, fallback to "others"
+#         doc_type = ocr_doc.get("doc_type", "others").lower()
+
+#         # Ensure image_ids is a list
+#         if not isinstance(image_ids, list):
+#             image_ids = [image_ids] if image_ids else []
+
+#         # Upload each image
+#         for img_id in image_ids:
+#             try:
+#                 image_file_id = ObjectId(img_id) if isinstance(img_id, str) else img_id
+#                 s3_key = f"{doc_type}/{image_file_id}.jpg"
+
+#                 # Check if file already exists in S3
+#                 try:
+#                     s3_client.head_object(Bucket=bucket_name, Key=s3_key)
+#                     print(f"File already exists: {s3_key}")
+#                     continue
+#                 except s3_client.exceptions.ClientError:
+#                     pass  # File doesn't exist, proceed with upload
+
+#                 print(f"Uploading image _id: {image_file_id} to folder '{doc_type}'")
+
+#                 # Fetch image bytes from GridFS
+#                 grid_out = fs.get(image_file_id)
+#                 image_bytes = grid_out.read()
+
+#                 # Upload to S3
+#                 s3_client.put_object(
+#                     Bucket=bucket_name,
+#                     Key=s3_key,
+#                     Body=BytesIO(image_bytes),
+#                     ContentType=content_type
+#                 )
+
+#                 print(f"✅ Uploaded image _id {image_file_id} to s3://{bucket_name}/{s3_key}")
+
+#             except gridfs.NoFile:
+#                 print(f"❌ File not found in GridFS: {image_file_id}")
+#                 continue
+#             except Exception as e:
+#                 print(f"❌ Error uploading image _id {image_file_id}: {e}")
+#                 continue
+
+
+
 
 app = FastAPI()
 
@@ -95,6 +205,34 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 
 
 
+
+
+
+# pdf
+
+def pdf_to_images(pdf_bytes, dpi=300):
+    """Convert PDF to high-quality images using PyMuPDF"""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        images = []
+        
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            # Increase DPI for better quality
+            mat = fitz.Matrix(dpi/72, dpi/72)  # 72 is default DPI
+            pix = page.get_pixmap(matrix=mat)
+            img_data = pix.tobytes("jpeg")
+            images.append(img_data)
+        
+        doc.close()
+        return images
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"PDF processing failed: {str(e)}")
+
+
+
+
+
 user_accounts = {
     "user1": {
         "username": "parashos",
@@ -103,7 +241,7 @@ user_accounts = {
     },
     "user2": {
         "username": "parasggn",
-        "password": "Paras@12",
+        "password": "Paras@123",
         "polyclinics": ["0149","0150", "0151", "0152","0153", "0154"]
     }
 }
@@ -134,6 +272,42 @@ def get_account_for_poly(poly_id: str):
             return details
     return None
 
+
+
+# ✅ PASTE THE OCR FUNCTION HERE
+async def run_ocr_prompt(prompt: str, base64_image: str):
+    """Run OCR prompt using OpenAI Vision API"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=2000,
+            temperature=0.1
+        )
+        
+        content = response.choices[0].message.content
+        
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return content
+            
+    except Exception as e:
+        print(f"OCR Error: {e}")
+        return {"error": str(e)}
 
 
 
@@ -217,12 +391,19 @@ fs = GridFS(db)
 # ---------- 1. ECHS Card/Temporary Slip Extraction ----------
 @app.post("/extract/echs_card")
 async def extract_echs_card(
+    background_tasks: BackgroundTasks,  #  ADD THIS PARAMETER
     file: UploadFile = File(None),
     current_user: dict = Depends(get_current_user)
 ):
     try:
         # Read file
         contents = await file.read()
+        if file.filename and file.filename.lower().endswith('.pdf'):
+            images = pdf_to_images(contents,dpi=300)
+            if not images:
+                raise HTTPException(status_code=400, detail="No pages found in PDF")
+            contents = images[0]
+
         base64_image = base64.b64encode(contents).decode("utf-8")
 
         # Upload file to GridFS
@@ -241,6 +422,18 @@ Schema (key order must be preserved):
   "DOM": string, // Value labeled 'DOM' (Date of Membership); same normalization rule as DOB; if absent, use 'Not Found'.
   "Service No": string // Service number of the ESM: prefer a printed value labeled 'Service No'; if not present, use clear handwritten alphanumeric text near the name/photo area that matches common military service number patterns (e.g., 'JC257424Y', 'IC 12345', 'SS-12345'); preserve case, spaces, and hyphens exactly. If both printed and handwritten exist, use the printed one. If none found, use 'Not Found'.
 }
+
+⚠️ CRITICAL CARD NUMBER EXTRACTION RULES:
+1. Card numbers MUST be extracted with EXACT format as printed - including ALL leading zeros
+2. NEVER convert to integer - always treat as string
+3. Examples of CORRECT extraction:
+   - If card shows "000002893071" → return exactly "000002893071" (preserve leading zeros)
+   - If card shows "JB 0000 0268 6390" → return exactly "JB 0000 0268 6390" (preserve spaces)
+   - If card shows "DL1 0000 0252 7144" → return exactly "DL1 0000 0252 7144" (preserve format)
+4. WRONG examples to avoid:
+   - Card shows "000002893071" → DO NOT return "2893071" (missing leading zeros)
+   - Card shows "JB 0000 0268 6390" → DO NOT return "JB0000026863900" (missing spaces)
+
 
                Extraction rules:
 
@@ -271,12 +464,17 @@ Output must be valid RFC 8259 JSON that parses without errors, with the exact ke
             "uploaded_at": datetime.utcnow()
         })
 
+
+        # background_tasks.add_task(upload_latest_to_s3)
+
         return {
             "status": "success", 
             "doc_type": "echs_card", 
             "ocr_result_id": str(result.inserted_id),
             "image_file_id": str(file_id),
-            "data": data
+            "data": data,
+            # "s3_sync": "started"
+            
         }
 
     except Exception as e:
@@ -290,12 +488,18 @@ async def extract_temporary_slip(
     try:
         # Read file
         contents = await file.read()
+
+        if file.filename and file.filename.lower().endswith('.pdf'):
+            images = pdf_to_images(contents,dpi=300)
+            if not images:
+                raise HTTPException(status_code=400, detail="No pages found in PDF")
+            contents = images[0]
+
         base64_image = base64.b64encode(contents).decode("utf-8")
 
         # Upload file to GridFS
         file_id = fs.put(contents, filename=file.filename, contentType=file.content_type)
         
-        # OCR Prompt
         prompt = """
                 You are analyzing an ECHS temporary receipt document. Extract ONLY these 8 fields exactly as seen:
 
@@ -363,11 +567,19 @@ Return only valid JSON with these exact 8 fields.
 # ---------- 2. Referral Letter Extraction ----------
 @app.post("/extract/referral_letter")
 async def extract_referral_letter(
+    background_tasks: BackgroundTasks,  # ADD THIS PARAMETER
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)
 ):
     try:
         contents = await file.read()
+
+        if file.filename and file.filename.lower().endswith('.pdf'):
+            images = pdf_to_images(contents,dpi=300)
+            if not images:
+                raise HTTPException(status_code=400, detail="No pages found in PDF")
+            contents = images[0]
+
         base64_image = base64.b64encode(contents).decode("utf-8")
         
         # Upload file to GridFS
@@ -500,7 +712,9 @@ Rules:
             "doc_type": "referral_letter",
             "ocr_result_id": str(result.inserted_id),
             "image_file_id": str(file_id), 
-            "data": data}
+            "data": data,
+            # "s3_sync": "started"
+            }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -511,6 +725,7 @@ Rules:
 @app.post("/extract/prescription")
 
 async def extract_prescription(
+    background_tasks: BackgroundTasks,  # ADD THIS PARAMETER
     files: List[UploadFile] = File(...),
     current_user: dict = Depends(get_current_user)
 ):
@@ -523,8 +738,27 @@ async def extract_prescription(
         contents, file_ids = [], []
         for f in files:
             b = await f.read()
-            contents.append(b)
-            file_ids.append(str(fs.put(b, filename=f.filename, contentType=f.content_type)))
+
+            if f.filename.lower().endswith('.pdf'):
+                images = pdf_to_images(b,dpi=300)
+                if images:
+                    # Convert all PDF pages to images
+                    for i, img_bytes in enumerate(images):
+                        contents.append(img_bytes)
+                        file_ids.append(str(fs.put(
+                            img_bytes, 
+                            filename=f"{f.filename}_page_{i+1}", 
+                            contentType="image/jpeg"
+                        )))
+                else:
+                    raise HTTPException(status_code=400, detail="Could not convert PDF to images")
+            else:
+                # Regular image file
+                contents.append(b)
+                file_ids.append(str(fs.put(b, filename=f.filename, contentType=f.content_type)))
+
+            #contents.append(b)
+            #file_ids.append(str(fs.put(b, filename=f.filename, contentType=f.content_type)))
 
         # Merge-if-two, else use single
         if len(contents) == 1:
@@ -549,7 +783,8 @@ async def extract_prescription(
 
 
 
-        # 🔹 Prompt for Prescription with Admission Advice
+
+        #  Prompt for Prescription with Admission Advice
         prompt = """
 Task: Analyze the attached medical prescription(s) and extract structured data as JSON.
 
@@ -618,7 +853,6 @@ Dates: include the written date(s) in ISO format if clear, else keep as seen (e.
 
 
 Now read the provided Prescription Page 1 and, if present, Page 2, apply the rules above, and output the single JSON object.
-i want to extract gender also / add one more text field is gender that extract gender refer attacted prescription so give me optimized prompt that able to extract gender also - iam giving my current promt not change other but add for gender. i want to extract majorly is what is doctor advised to patient, or what treatment advised / admission or any  that should extract proprly
 """
 
         # OCR + LLM extraction
@@ -633,13 +867,18 @@ i want to extract gender also / add one more text field is gender that extract g
             "uploaded_at": datetime.utcnow()
         })
 
+
+        #  ADD S3 UPLOAD AS BACKGROUND TASK
+        # background_tasks.add_task(upload_latest_to_s3)
+
         return {
             "status": "success",
             "doc_type": "prescription",
             "ocr_result_id": str(result.inserted_id),
             # "image_file_id": str(file_id),
             "image_file_id": file_ids if len(file_ids) > 1 else file_ids[0],
-            "data": data
+            "data": data,
+            # "s3_sync": "started"
         }
  
     except Exception as e:
@@ -665,7 +904,7 @@ async def extract_aadhar_card(
         You are analyzing an Aadhaar Card. Extract:
         - Aadhaar No
         - Name
-        - Date of Birth
+        - Date of Birthm
         - Gender
         Do not preassume anything.
         If missing, return "Not Found".
@@ -897,8 +1136,6 @@ async def update_request_ocr_results(
 
 
 
-
-
 @app.post("/generate_claim_id")
 def generate_claim_id():
     try:
@@ -911,8 +1148,6 @@ def generate_claim_id():
             
         )
         
-
-
         if not referral:
             raise Exception("No referral data found in MongoDB!")
 
@@ -926,8 +1161,6 @@ def generate_claim_id():
         center_code = referral_no[:4]
         trimmed_referral = referral_no[4:]
 
-
-
         account = get_account_for_poly(center_code)
         if not account:
             raise Exception(f"No account found for polyclinic {center_code}")
@@ -936,8 +1169,23 @@ def generate_claim_id():
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
 
-            # --- Login page ---
-            page.goto("https://www.echsbpa.utiitsl.com/ECHS/")
+
+            
+            try:
+                page.goto("https://www.echsbpa.utiitsl.com/ECHS", timeout=30000)
+            except PlaywrightError as e:
+                msg = str(e)
+                if "ERR_CONNECTION_RESET" in msg or "net::ERR" in msg:
+                    error_msg = "ECHS Portal is currently not responding. Please try again after some time."
+                    ocr_collection.update_one(
+                        {"_id": referral["_id"]},
+                        {"$set": {"extracted_data.ErrorMessage": error_msg}}
+                    )
+                browser.close()
+                return {"status": "error", "message": error_msg}
+                raise
+                
+
             page.fill("#username", account["username"])
             page.fill("#password", account["password"])
 
@@ -957,11 +1205,47 @@ def generate_claim_id():
                     ],
                 }]
             )
+
+
+
             captcha_text = response.output_text
             captcha_text = re.sub(r"[^0-9]", "", captcha_text).strip()
             page.fill("#txtCaptcha", captcha_text)
             page.get_by_role("button", name="Sign In").click()
             page.wait_for_timeout(3000)
+
+
+
+            # --- Login error popups (specific) ---
+            error_message = None
+
+            # 1) Failure / captcha popup
+            try:
+                alert_popup = "#ws_alert_dialog"
+                page.wait_for_selector(alert_popup, state="visible", timeout=3000)
+                error_message = page.inner_text(f"{alert_popup} #alertpara").strip()
+            except PlaywrightTimeoutError:
+                pass
+
+            # 2) Invalid login info popup
+            if not error_message:
+                try:
+                    info_popup = "#ws_info_dialog"
+                    page.wait_for_selector(info_popup, state="visible", timeout=3000)
+                    error_message = page.inner_text(f"{info_popup} #infopara").strip()
+                except PlaywrightTimeoutError:
+                    pass
+
+            if error_message:
+                ocr_collection.update_one(
+                    {"_id": referral["_id"]},
+                    {"$set": {"extracted_data.ErrorMessage": error_message}}
+                )
+                browser.close()
+                return {"status": "error", "message": error_message}
+
+
+
 
             # --- Close popup if exists ---
             try:
@@ -1038,11 +1322,6 @@ def generate_claim_id():
 
 
 
-
-
-
-
-
     #Repeate/Follow up
 
 @app.post("/generate_claim_id_followup")
@@ -1068,12 +1347,37 @@ def generate_claim_id_followup():
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
+
+            # page = browser.new_page()
+
+            # # --- Login page ---
+            # page.goto("https://www.echsbpa.utiitsl.com/ECHS/")
+            # page.fill("#username", account["username"])
+            # page.fill("#password", account["password"])
+
+
             page = browser.new_page()
 
-            # --- Login page ---
-            page.goto("https://www.echsbpa.utiitsl.com/ECHS/")
+            try:
+                page.goto("https://www.echsbpa.utiitsl.com/ECHS/", timeout=30000)
+            except PlaywrightError as e:
+                msg = str(e)
+                if "ERR_CONNECTION_RESET" in msg or "net::ERR" in msg:
+                    error_msg = "ECHS Portal is currently not responding. Please try again after some time."
+                    ocr_collection.update_one(
+                        {"_id": referral["_id"]},
+                        {"$set": {"extracted_data.ErrorMessage": error_msg}}
+                    )
+                browser.close()
+                return {"status": "error", "message": error_msg}
+                raise
+                
+
             page.fill("#username", account["username"])
+
             page.fill("#password", account["password"])
+
+
 
             # --- CAPTCHA Handling ---
             captcha_selector = "#img_captcha"
@@ -1097,6 +1401,39 @@ def generate_claim_id_followup():
             page.get_by_role("button", name="Sign In").click()
             page.wait_for_timeout(3000)
 
+
+
+
+# --- Login error popups (specific) ---
+            error_message = None
+
+            # 1) Failure / captcha popup
+            try:
+                alert_popup = "#ws_alert_dialog"
+                page.wait_for_selector(alert_popup, state="visible", timeout=3000)
+                error_message = page.inner_text(f"{alert_popup} #alertpara").strip()
+            except PlaywrightTimeoutError:
+                pass
+
+            # 2) Invalid login info popup
+            if not error_message:
+                try:
+                    info_popup = "#ws_info_dialog"
+                    page.wait_for_selector(info_popup, state="visible", timeout=3000)
+                    error_message = page.inner_text(f"{info_popup} #infopara").strip()
+                except PlaywrightTimeoutError:
+                    pass
+
+            if error_message:
+                ocr_collection.update_one(
+                    {"_id": referral["_id"]},
+                    {"$set": {"extracted_data.ErrorMessage": error_message}}
+                )
+                browser.close()
+                return {"status": "error", "message": error_message}
+
+
+
             # --- Close popup if exists ---
             try:
                 popup_selector = 'button:has-text("Close")'
@@ -1113,31 +1450,127 @@ def generate_claim_id_followup():
             # Referral number full (no trimming)
             page.locator("#referenceNumber").fill(referral_no)
             
+
+            # page.locator("#referenceNumber").fill("01470000555794")
+
             page.get_by_role("button", name="Submit").click()
             page.wait_for_timeout(6000)
 
 
+        # --- Check for failure popup ---
+            try:
+                page.locator("#ws_alert_dialog").wait_for(state="visible", timeout=6000)
+                failure_text = page.locator("#ws_alert_dialog #alertpara").inner_text().strip()
+                
+                # Extract Previous Claim ID
+                try:
+                    prev_claim_id = page.locator("#claimId").input_value().strip()
+                except:
+                    prev_claim_id = ""
 
-            # --- Extract Old Claim ID popup ---
+                # Combine both into one message
+                final_message = f"{failure_text} | Previous Claim ID: {prev_claim_id}"
+
+
+                # Save failure message in DB
+                ocr_collection.update_one(
+                    {"_id": referral["_id"]},
+                    {"$set": {"extracted_data.ErrorMessage": final_message}}
+                )
+                browser.close()
+                return {"status": "error", "message": final_message}
+            except:
+                pass
+
+       
+
+            # # --- Extract Old Claim ID popup ---
+            # old_claim_popup = "#ws_info_dialog"
+            # if page.locator(old_claim_popup).is_visible():
+            #     popup_text = page.locator(f"{old_claim_popup} #infopara").inner_text().strip()
+            #     match = re.search(r"old claim id\s*-\s*(\d+)", popup_text, re.IGNORECASE)
+            #     old_claim_id = match.group(1) if match else None
+
+            #     if old_claim_id:
+            #         ocr_collection.update_one(
+            #             {"_id": referral["_id"]},
+            #             {"$set": {"extracted_data.Old Claim ID": old_claim_id}}
+            #         )
+
+
+
+
+
+# --- Extract Parent / Old Claim ID popup ---
             old_claim_popup = "#ws_info_dialog"
+
             if page.locator(old_claim_popup).is_visible():
-                popup_text = page.locator(f"{old_claim_popup} #infopara").inner_text().strip()
-                match = re.search(r"old claim id\s*-\s*(\d+)", popup_text, re.IGNORECASE)
+                popup_text = page.inner_text(old_claim_popup).strip()
+                print("PARENT POPUP TEXT:", popup_text)
+
+                # "The parent claim id of is 40727553" se number nikalne ke liye
+                match = re.search(r"parent claim id.*?(\d+)", popup_text, re.IGNORECASE)
                 old_claim_id = match.group(1) if match else None
+                print("Old Claim id :", old_claim_id)
 
                 if old_claim_id:
                     ocr_collection.update_one(
                         {"_id": referral["_id"]},
                         {"$set": {"extracted_data.Old Claim ID": old_claim_id}}
                     )
+
+
             page.wait_for_timeout(6000)
                 # Close old claim popup
 
             page.locator("//button[@class='ui-button ui-corner-all ui-widget']").click()    
             # page.click(f"{old_claim_popup} button:has-text('Close')")
             page.wait_for_timeout(6000)
+
+            # --- Balance Number Of Session check (early) ---
+            balance_text = page.inner_text(
+                "css=td:has-text('Balance Number Of Session') + td"
+            ).strip()
+            print("BALANCE TEXT:", balance_text)
+
+            try:
+                balance = int(balance_text)
+            except ValueError:
+                balance = 0
+
+            if balance <= 0:
+                error_msg = "Balance sessions have been exhausted"
+                ocr_collection.update_one(
+                    {"_id": referral["_id"]},
+                    {"$set": {"extracted_data.ErrorMessage": error_msg}}
+                )
+                browser.close()
+                return {"status": "error", "message": error_msg}
+
+
+
+
             # --- Select Yes and In-patient ---
             page.select_option("#confirmAdmit", "Y")
+
+# here code for in- patient logic
+
+            revisit_select = page.locator("select[name='revisitPatientType']")
+            revisit_select.wait_for(state="visible", timeout=10000)
+
+
+            # 3) In-Patient option check
+            options_text = revisit_select.inner_text().lower()
+            if "in-patient" not in options_text:
+                error_msg = "Referral already used in OPD"
+                ocr_collection.update_one(
+                    {"_id": referral["_id"]},
+                    {"$set": {"extracted_data.ErrorMessage": error_msg}}
+                )
+                browser.close()
+                return {"status": "error", "message": error_msg}
+
+
             page.select_option("select[name='revisitPatientType']", "I")  # In-patient
             page.wait_for_timeout(3000)
 
@@ -1172,18 +1605,50 @@ def generate_claim_id_followup():
             # except:
             #     pass
 
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(10000)
 
 
-            # --- Extract New Claim ID popup ---
+            # # --- Extract New Claim ID popup ---
+            # popup_selector2 = "#ws_Success_dialog"
+            # page.wait_for_selector(popup_selector2, state="visible", timeout=10000)
+            # popup_text = page.locator(popup_selector2).inner_text()
+            # print("Popup text:", popup_text)
+
+            # match = re.search(r"new claim id\s*(\d+)", popup_text, re.IGNORECASE)
+            # claim_id = match.group(1) if match else None
+            # if not claim_id:
+            #     raise Exception("New Claim ID not found!")
+
+
+
+
+
             popup_selector2 = "#ws_Success_dialog"
-            page.wait_for_selector(popup_selector2, state="visible")
-            popup_text = page.locator(popup_selector2).inner_text()
 
-            match = re.search(r"claim id\s*-\s*(\d+)", popup_text, re.IGNORECASE)
-            claim_id = match.group(1) if match else None
-            if not claim_id:
-                raise Exception("New Claim ID not found!")
+            try:
+                # Pehle dialog ka wait karo
+                page.wait_for_selector(popup_selector2, state="visible", timeout=20000)
+                popup_text = page.inner_text(popup_selector2).strip()
+                print("Success dialog text:", popup_text)
+
+                match = re.search(r"new claim id\s*(\d+)", popup_text, re.IGNORECASE)
+                if not match:
+                    raise Exception("New Claim ID not found in success dialog")
+                claim_id = match.group(1)
+                print("extracting msg")
+
+            except PlaywrightTimeoutError:
+                # Agar dialog nahi aaya to fallback: page text se nikaalo
+                page.wait_for_load_state("networkidle", timeout=20000)
+                full_text = page.inner_text("body").strip()
+                print("Page text (fallback):", full_text[:500])
+
+                match = re.search(r"new claim id\s*(\d+)", full_text, re.IGNORECASE)
+                if not match:
+                    raise Exception("New Claim ID not found in page text")
+                claim_id = match.group(1)
+
+
 
             # Save new Claim ID in DB    # update here code for new claim id 
             ocr_collection.update_one(
@@ -1239,6 +1704,12 @@ def search_referral_letter(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+from datetime import timezone, timedelta
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
 # Get history for logged-in user
 @app.get("/history")
 def get_history(current_user: dict = Depends(get_current_user)):
@@ -1263,7 +1734,13 @@ def get_user_history(user_id: str):
                         h[key_name] = {
                             "id": str(ocr_result["_id"]),
                             "data": ocr_result.get("extracted_data", {}),
-                            "uploaded_at": ocr_result.get("uploaded_at")
+                            
+                            # "uploaded_at": datetime.now(IST) ,
+                            # "uploaded_at": ocr_result.get("uploaded_at") # here need to cahnge
+                            "uploaded_at": ocr_result.get("uploaded_at").astimezone(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S") if ocr_result.get("uploaded_at") else None
+
+
+
                         }
                     else:
                         h[key_name] = None
@@ -1349,11 +1826,18 @@ def export_patient_data():
 
 @app.get("/echs_data")
 def echs_data(limit:Optional[int]=None):
+
+
+
         # MongoDB connection string
     CONNECTION_STRING = "mongodb+srv://pilot:pilot@cluster1.rkupr.mongodb.net/?retryWrites=true&w=majority"
 
     # Connect to MongoDB
     client = MongoClient(CONNECTION_STRING)
+
+
+
+    
 
     try:
         # Print available databases and collections
@@ -1366,12 +1850,19 @@ def echs_data(limit:Optional[int]=None):
         df2 = pd.DataFrame(list(db["fs.files"].find()))
         df1 = pd.DataFrame(list(db["requests_history"].find()))
 
+
+
+
+
+
     finally:
         client.close()
         print("MongoDB connection closed.")
         print("", df.shape)
         print("", df2.shape)
         print("", df1.shape)
+
+
     df1['echs_card_result_id'] = df1['echs_card_result_id'].astype(str)
     df1['referral_letter_result_id'] = df1['referral_letter_result_id'].astype(str)
     df1['prescription_result_id'] = df1['prescription_result_id'].astype(str)
@@ -1388,8 +1879,32 @@ def echs_data(limit:Optional[int]=None):
     final = final.rename(columns = {'filename_x' : 'echs_img','filename_y' : 'refferal_img'})
     final = final[['echs_upload_date','echs_data','referral_letter_data'	,'refferal_upload_date','echs_img','refferal_img']]
 
+
+
+ # ✅ ADD THIS SECTION HERE (NEW CODE)  / for card no. downloaded CSV was showing inconsistent data that fixed using this code
+    def fix_card_numbers_in_data(row):
+        # Fix ECHS data
+        if pd.notna(row['echs_data']) and isinstance(row['echs_data'], dict):
+            if 'Card No' in row['echs_data']:
+                row['echs_data']['Card No'] = str(row['echs_data']['Card No'])
+        
+        # Fix Referral data if it has card numbers
+        if pd.notna(row['referral_letter_data']) and isinstance(row['referral_letter_data'], dict):
+            if 'Card No' in row['referral_letter_data']:
+                row['referral_letter_data']['Card No'] = str(row['referral_letter_data']['Card No'])
+        
+        return row
+
+    # Apply the fix to all rows
+    final = final.apply(fix_card_numbers_in_data, axis=1)
+    # ✅ END OF NEW CODE
+
+
+
     result = final.to_dict(orient='records')
     return {"echs_data": result}
+
+
 
 
 
