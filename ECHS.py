@@ -22,7 +22,7 @@ from pymongo import MongoClient
 import pandas as pd
 import ssl
 
-
+import time
 
 from typing import List
 from PIL import Image
@@ -1138,6 +1138,7 @@ async def update_request_ocr_results(
 
 @app.post("/generate_claim_id")
 def generate_claim_id():
+    start_time = time.time()  # --- START TIMER
     try:
         # --- Fetch latest referral from DB ---
         # referral = ocr_collection.find_one(sort=[("_id", -1)])
@@ -1212,7 +1213,7 @@ def generate_claim_id():
             captcha_text = re.sub(r"[^0-9]", "", captcha_text).strip()
             page.fill("#txtCaptcha", captcha_text)
             page.get_by_role("button", name="Sign In").click()
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(1000)
 
 
 
@@ -1267,7 +1268,7 @@ def generate_claim_id():
             page.locator("(//input[@name='cardnum2'])[1]").fill(trimmed_referral)
             page.locator("(//input[@name='serviceNo'])[1]").fill(referral["extracted_data"]["Service No"])
             page.get_by_role("button", name="Search").click()
-            page.wait_for_timeout(6000)
+            page.wait_for_timeout(2000)
 
             # --- Check for failure popup ---
             try:
@@ -1288,7 +1289,7 @@ def generate_claim_id():
             page.wait_for_selector("input[type='radio'][value='Y']")
             page.locator("input[type='radio'][value='Y']").check()
             page.get_by_text('Submit').click()
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(1000)
 
             # --- Extract Claim ID ---
             popup_selector2 = "#ws_success_dialog"
@@ -1307,9 +1308,20 @@ def generate_claim_id():
             )
 
             browser.close()
+
+            end_time = time.time()  # --- END TIMER
+            print("Execution time for /generate_claim_id:", end_time - start_time, "seconds")
+
+
+
+
+
             return {"status": "success", "claim_id": claim_id}
 
     except Exception as e:
+        end_time = time.time()
+        print("Execution time for /generate_claim_id (error):", end_time - start_time, "seconds")
+
         error_msg = str(e) or repr(e)
         tb = traceback.format_exc()
         # Save error in DB
@@ -1399,7 +1411,7 @@ def generate_claim_id_followup():
             captcha_text = re.sub(r"[^0-9]", "", captcha_text).strip()
             page.fill("#txtCaptcha", captcha_text)
             page.get_by_role("button", name="Sign In").click()
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(1000)
 
 
 
@@ -1454,7 +1466,7 @@ def generate_claim_id_followup():
             # page.locator("#referenceNumber").fill("01470000555794")
 
             page.get_by_role("button", name="Submit").click()
-            page.wait_for_timeout(6000)
+            # page.wait_for_timeout(6000)
 
 
         # --- Check for failure popup ---
@@ -1482,23 +1494,6 @@ def generate_claim_id_followup():
             except:
                 pass
 
-       
-
-            # # --- Extract Old Claim ID popup ---
-            # old_claim_popup = "#ws_info_dialog"
-            # if page.locator(old_claim_popup).is_visible():
-            #     popup_text = page.locator(f"{old_claim_popup} #infopara").inner_text().strip()
-            #     match = re.search(r"old claim id\s*-\s*(\d+)", popup_text, re.IGNORECASE)
-            #     old_claim_id = match.group(1) if match else None
-
-            #     if old_claim_id:
-            #         ocr_collection.update_one(
-            #             {"_id": referral["_id"]},
-            #             {"$set": {"extracted_data.Old Claim ID": old_claim_id}}
-            #         )
-
-
-
 
 
 # --- Extract Parent / Old Claim ID popup ---
@@ -1520,12 +1515,12 @@ def generate_claim_id_followup():
                     )
 
 
-            page.wait_for_timeout(6000)
+            page.wait_for_timeout(1000)
                 # Close old claim popup
 
             page.locator("//button[@class='ui-button ui-corner-all ui-widget']").click()    
             # page.click(f"{old_claim_popup} button:has-text('Close')")
-            page.wait_for_timeout(6000)
+            page.wait_for_timeout(1000)
 
             # --- Balance Number Of Session check (early) ---
             balance_text = page.inner_text(
@@ -1572,7 +1567,7 @@ def generate_claim_id_followup():
 
 
             page.select_option("select[name='revisitPatientType']", "I")  # In-patient
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(1000)
 
 
 
@@ -1594,32 +1589,8 @@ def generate_claim_id_followup():
                 except TimeoutError:
                     print("Failed to click the Submit button using both locators")
 
-            # page.locator("//input[@onclick='return validateRepeat();'']").click()
-            # page.get_by_role("button", name="Submit").click()
 
-
-            # page.wait_for_timeout(3000)
-            # Accept dialog if appears
-            # try:
-            #     page.on("dialog", lambda dialog: dialog.accept())
-            # except:
-            #     pass
-
-            page.wait_for_timeout(10000)
-
-
-            # # --- Extract New Claim ID popup ---
-            # popup_selector2 = "#ws_Success_dialog"
-            # page.wait_for_selector(popup_selector2, state="visible", timeout=10000)
-            # popup_text = page.locator(popup_selector2).inner_text()
-            # print("Popup text:", popup_text)
-
-            # match = re.search(r"new claim id\s*(\d+)", popup_text, re.IGNORECASE)
-            # claim_id = match.group(1) if match else None
-            # if not claim_id:
-            #     raise Exception("New Claim ID not found!")
-
-
+            page.wait_for_timeout(3000)
 
 
 
