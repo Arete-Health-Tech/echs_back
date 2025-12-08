@@ -58,6 +58,10 @@ import pytz
 
 import fitz
 
+import uuid
+OCR_RESULTS = {}
+
+
 
 # app = FastAPI()
 load_dotenv()
@@ -588,21 +592,25 @@ async def extract_referral_letter(
         prompt = """
 You are analyzing a Referral Letter. CRITICAL: You have been making consistent errors with specific fields and characters. Follow these rules exactly.
 
+
 KNOWN ERROR PATTERNS TO AVOID:
-1. REFERRAL NO ERROR: You frequently read "01440000402039" as "01440000402319" 
+1. REFERRAL NO ERROR: You frequently read "01440000402039" as "01440000402319"
    - This happens because you insert an extra "1" and change "0" to "3"
    - The pattern "...402039" should NEVER become "...402319"
    - If you see 15+ digits, you've made a segmentation error
 
+
 2. SERVICE NO ERROR: You sometimes confuse Service No with other numbers
    - Service No format: 8-10 digits + 1 letter (e.g., "477762440Y")
    - Do NOT use Contact Numbers, Card Numbers, or Referral Numbers
+   
 
 3. AGE/DECIMAL POINT ERROR: You read decimal points as letters
    - "52.8" becomes "52 B" - WRONG
    - "45.5" becomes "45 S" - WRONG  
    - "38.2" becomes "38 Z" - WRONG
    - Pattern: [number].[digit] should NEVER become [number] [letter]
+
 
 CHARACTER RECOGNITION RULES:
 Pay special attention to these character confusions:
@@ -614,28 +622,39 @@ Pay special attention to these character confusions:
 - Number 8 vs letter B
 - Number 2 vs letter Z
 
+
 DECIMAL NUMBER DETECTION:
 - If you see [digit][space][letter] pattern in numeric fields, it's likely a decimal point error
 - Example: "52 B" should be "52.8", "45 S" should be "45.5"
 - Context check: Age, measurements, scores are often decimals, not "number + letter"
 
+
 CRITICAL EXTRACTION RULES:
 - Referral No: Must be EXACTLY 14 digits from field labeled 'Referral No'
-- Service No: Must be digits+letter from field labeled 'Service No' 
+- Service No: Must be digits+letter from field labeled 'Service No'
 - Age: Should be numeric (can include decimals), not "number + letter"
 - Read each character individually to prevent segmentation/recognition errors
 - For numeric fields, verify decimal points aren't read as letters
 
+
 FIELD-SPECIFIC INSTRUCTIONS:
 Referral No: After extraction, double-check positions 11-14. If you see "2319" at end, it's likely wrong - should be "2039"
-Service No: Look for explicit 'Service No' label, usually ends with Y, X, A, or similar letter
+Service No: Take ONLY from the field labeled "Service No". 
+  Copy the text EXACTLY as printed, including any leading or trailing symbols like /, -, or $.
+  The character "$" must remain "$" and must NOT be changed to "5" or "S".
+  Do NOT remove $, /, -, or spaces.
+  For example, if the document shows "$6879221$", you must return exactly "$6879221$".
+  Do not convert the Service No into a plain number or change any digit.
+  If any character in Service No is unclear or ambiguous, return "Not Found" for this field instead of guessing.
 Age: Should be purely numeric (e.g., "52.8", "45", "62.5") - if you see "52 B", it should be "52.8"
 Clinical Notes: Extract ONLY from 'Clinical Notes' section - never mix with Admission data
 Admission: Extract ONLY from 'Admission' section - never use Clinical Notes data
 Investigation: Extract ONLY from 'Investigation' section
 Referred To: Extract ONLY from 'Referred To' section
 
+
 Extract the fields below exactly as named and return one JSON object that follows the schema and rules strictly. Do not include extra keys, comments, or prose. If any field is missing or illegible, return exactly 'Not Found'. Return only valid JSON.
+
 
 Schema (key order fixed):
 {
@@ -663,6 +682,7 @@ Schema (key order fixed):
 "Claim ID": string // Value labeled 'Claim ID' only; never use Referral No.
 }
 
+
 VALIDATION STEPS:
 1. After extracting Referral No, count digits (must be exactly 14)
 2. Check for known error pattern "402319" - should be "402039"
@@ -671,20 +691,23 @@ VALIDATION STEPS:
 5. Ensure no data mixing between Clinical Notes and Admission fields
 6. For any numeric fields showing "number + single letter", check if it should be decimal
 
+
 DECIMAL POINT CORRECTIONS:
 - "52 B" → "52.8"
-- "45 S" → "45.5" 
+- "45 S" → "45.5"
 - "38 Z" → "38.2"
 - "67 G" → "67.6"
 - Pattern: If numeric field shows [digit][space][letter], likely decimal point error
 
+
 FINAL CHECK:
 - Referral No: Exactly 14 digits, check end digits for "2039" vs "2319" error
-- Service No: From Service No field only, ends with letter
+- Service No: From Service No field only
 - Age: Numeric format only (no letters unless it's actually part of age like "52 years")
 - Field Separation: No mixing of Clinical Notes with Admission data
 - Character Count: If numbers have wrong digit count, mark as 'Not Found'
 - Decimal Recognition: Convert "number letter" patterns to "number.digit" in numeric fields
+
 
 Rules:
 1. FIELD ISOLATION: Extract each field ONLY from its specifically labeled section
@@ -694,7 +717,6 @@ Rules:
 5. DATA INTEGRITY: Never mix content between different labeled sections
 6. NUMERIC VALIDATION: Ensure numeric fields contain proper numbers, not "number + letter"
 7. Output must be RFC 8259 compliant JSON with exact key names and order above; no comments or trailing commas.
-
            """
 
         data = await run_ocr_prompt(prompt, base64_image)
@@ -1167,7 +1189,7 @@ def generate_claim_id():
             raise Exception(f"No account found for polyclinic {center_code}")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=False)
             page = browser.new_page()
 
 
@@ -1201,7 +1223,7 @@ def generate_claim_id():
                 input=[{
                     "role": "user",
                     "content": [
-                        {"type": "input_text", "text": "Read the digits from this CAPTCHA image. Only return the numbers."},
+                        {"type": "input_text", "text": "Read the CAPTCHA exactly as shown. It may contain both letters and numbers. Return the characters in the same order, without any explanation. If there are spaces or gaps between characters, ignore the gaps and return a single continuous string of the CAPTCHA text."},
                         {"type": "input_image", "image_url": base64_image}
                     ],
                 }]
@@ -1210,7 +1232,15 @@ def generate_claim_id():
 
 
             captcha_text = response.output_text
-            captcha_text = re.sub(r"[^0-9]", "", captcha_text).strip()
+            captcha_text = captcha_text.strip()
+            captcha_text = captcha_text.replace(" ", "")
+            captcha_text = captcha_text.replace("\n", "").replace("\r", "").replace("\t", "")
+            captcha_text = "".join(ch for ch in captcha_text if ch.isalnum())
+            # captcha_text = re.sub(r"[^0-9]", "", captcha_text).strip()
+            captcha_text = "".join(ch for ch in captcha_text if ch.isalnum())
+            captcha_text = captcha_text.upper()
+            print("MODEL RAW:", repr(response.output_text))
+            print("CAPTCHA FINAL:", repr(captcha_text))
             page.fill("#txtCaptcha", captcha_text)
             page.get_by_role("button", name="Sign In").click()
             page.wait_for_timeout(1000)
@@ -1250,7 +1280,7 @@ def generate_claim_id():
 
             # --- Close popup if exists ---
             try:
-                popup_selector = 'button:has-text("Close")'
+                popup_selector = 'button.ui-dialog-titlebar-close'
                 if page.locator(popup_selector).is_visible():
                     page.click(popup_selector)
             except:
@@ -1358,7 +1388,7 @@ def generate_claim_id_followup():
             raise Exception(f"No account found for polyclinic {center_code}")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=False)
 
             # page = browser.new_page()
 
@@ -1385,11 +1415,10 @@ def generate_claim_id_followup():
                 raise
                 
 
+            
+
             page.fill("#username", account["username"])
-
             page.fill("#password", account["password"])
-
-
 
             # --- CAPTCHA Handling ---
             captcha_selector = "#img_captcha"
@@ -1402,18 +1431,27 @@ def generate_claim_id_followup():
                 input=[{
                     "role": "user",
                     "content": [
-                        {"type": "input_text", "text": "Read the digits from this CAPTCHA image. Only return the numbers."},
+                        {"type": "input_text", "text": "Read the CAPTCHA exactly as shown. It may contain both letters and numbers. Return the characters in the same order, without any explanation. If there are spaces or gaps between characters, ignore the gaps and return a single continuous string of the CAPTCHA text."},
                         {"type": "input_image", "image_url": base64_image}
                     ],
                 }]
             )
+
+
+
             captcha_text = response.output_text
-            captcha_text = re.sub(r"[^0-9]", "", captcha_text).strip()
+            captcha_text = captcha_text.strip()
+            captcha_text = captcha_text.replace(" ", "")
+            captcha_text = captcha_text.replace("\n", "").replace("\r", "").replace("\t", "")
+            captcha_text = "".join(ch for ch in captcha_text if ch.isalnum())
+            # captcha_text = re.sub(r"[^0-9]", "", captcha_text).strip()
+            captcha_text = "".join(ch for ch in captcha_text if ch.isalnum())
+            captcha_text = captcha_text.upper()
+            print("MODEL RAW:", repr(response.output_text))
+            print("CAPTCHA FINAL:", repr(captcha_text))
             page.fill("#txtCaptcha", captcha_text)
             page.get_by_role("button", name="Sign In").click()
             page.wait_for_timeout(1000)
-
-
 
 
 # --- Login error popups (specific) ---
@@ -1448,7 +1486,7 @@ def generate_claim_id_followup():
 
             # --- Close popup if exists ---
             try:
-                popup_selector = 'button:has-text("Close")'
+                popup_selector = 'button.ui-dialog-titlebar-close'
                 if page.locator(popup_selector).is_visible():
                     page.click(popup_selector)
             except:
