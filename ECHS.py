@@ -245,7 +245,7 @@ user_accounts = {
     },
     "user2": {
         "username": "parasggn",
-        "password": "Paras@123",
+        "password": "Paras#12",
         "polyclinics": ["0149","0150", "0151", "0152","0153", "0154"]
     }
 }
@@ -278,7 +278,7 @@ def get_account_for_poly(poly_id: str):
 
 
 
-# ✅ PASTE THE OCR FUNCTION HERE
+# PASTE THE OCR FUNCTION HERE
 async def run_ocr_prompt(prompt: str, base64_image: str):
     """Run OCR prompt using OpenAI Vision API"""
     try:
