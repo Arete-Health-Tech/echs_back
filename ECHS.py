@@ -1155,9 +1155,6 @@ async def update_request_ocr_results(
 
 
 
-
-
-
 @app.post("/generate_claim_id")
 def generate_claim_id():
     start_time = time.time()  # --- START TIMER
@@ -1175,7 +1172,6 @@ def generate_claim_id():
             raise Exception("No referral data found in MongoDB!")
 
 
-
         referral_no = referral["extracted_data"]["Referral No"]
 
         # extracted_data = referral.get("extracted_data", {})
@@ -1187,13 +1183,13 @@ def generate_claim_id():
         account = get_account_for_poly(center_code)
         if not account:
             raise Exception(f"No account found for polyclinic {center_code}")
+        
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
 
-
-            
+        
             try:
                 page.goto("https://www.echsbpa.utiitsl.com/ECHS", timeout=30000)
             except PlaywrightError as e:
@@ -1207,12 +1203,13 @@ def generate_claim_id():
                 browser.close()
                 return {"status": "error", "message": error_msg}
                 raise
-                
+                    
 
             page.fill("#username", account["username"])
             page.fill("#password", account["password"])
 
-            # --- CAPTCHA Handling ---
+
+                # --- CAPTCHA Handling ---
             captcha_selector = "#img_captcha"
             page.wait_for_selector(captcha_selector)
             captcha_buffer = page.locator(captcha_selector).screenshot()
@@ -1241,16 +1238,16 @@ def generate_claim_id():
             captcha_text = captcha_text.upper()
             print("MODEL RAW:", repr(response.output_text))
             print("CAPTCHA FINAL:", repr(captcha_text))
+
+
             page.fill("#txtCaptcha", captcha_text)
             page.get_by_role("button", name="Sign In").click()
             page.wait_for_timeout(1000)
 
 
-
-            # --- Login error popups (specific) ---
             error_message = None
 
-            # 1) Failure / captcha popup
+                # 1) Failure / captcha popup
             try:
                 alert_popup = "#ws_alert_dialog"
                 page.wait_for_selector(alert_popup, state="visible", timeout=3000)
@@ -1258,7 +1255,7 @@ def generate_claim_id():
             except PlaywrightTimeoutError:
                 pass
 
-            # 2) Invalid login info popup
+                # 2) Invalid login info popup
             if not error_message:
                 try:
                     info_popup = "#ws_info_dialog"
@@ -1267,28 +1264,64 @@ def generate_claim_id():
                 except PlaywrightTimeoutError:
                     pass
 
-            if error_message:
+
+
+                            # --- Decide: captcha error / MoA warning / real error ---
+                if error_message:
+                    clean_msg = " ".join(error_message.split())
+                    print("LOGIN CLEAN MSG:", repr(clean_msg))
+
+                  
+
+
+                # 2) MoA warning -> ignore + close
+            if "MoA validity period is getting expired" in clean_msg:
+                try:
+                    page.locator("div.ui-dialog button.ui-dialog-titlebar-close").last.click(force=True)
+                except Exception:
+                    pass
+                   
+
+            else:
+                    # 3) remaning login errors
                 ocr_collection.update_one(
                     {"_id": referral["_id"]},
                     {"$set": {"extracted_data.ErrorMessage": error_message}}
-                )
+                    )
                 browser.close()
                 return {"status": "error", "message": error_message}
+    
 
 
-
-
-            # --- Close popup if exists ---
+            # login successful ---
+            
             try:
-                popup_selector = 'button.ui-dialog-titlebar-close'
-                if page.locator(popup_selector).is_visible():
-                    page.click(popup_selector)
-            except:
-                pass
+                dialog_close = page.locator("div.ui-dialog button.ui-dialog-titlebar-close")
+
+                for _ in range(5):  # safety: max 5 dialogs
+                    count = dialog_close.count()
+                    print("LOGIN DIALOG COUNT:", count)
+                    if count == 0:
+                        break
+
+                    btn = dialog_close.nth(count - 1)  # top-most dialog
+                    if btn.is_visible():
+                        print("CLICKING DIALOG INDEX:", count - 1)
+                        btn.click(force=True)
+                        page.wait_for_timeout(500)
+                    else:
+                        print("TOP DIALOG NOT VISIBLE, BREAK")
+                        break
+            except Exception as e:
+                print("LOGIN DIALOG CLOSE ERROR:", e)
+
 
             # --- Referral Flow ---
             page.locator("#ihaveseennmi").check()
+
+
             page.get_by_role("link", name="Intimation").click()
+
             page.get_by_role("link", name="Accept Referral").click()
 
             if center_code not in center_map:
@@ -1300,20 +1333,33 @@ def generate_claim_id():
             page.get_by_role("button", name="Search").click()
             page.wait_for_timeout(2000)
 
+
             # --- Check for failure popup ---
             try:
                 page.locator("#ws_alert_dialog").wait_for(state="visible", timeout=6000)
                 failure_text = page.locator("#ws_alert_dialog #alertpara").inner_text().strip()
 
-                # Save failure message in DB
-                ocr_collection.update_one(
-                    {"_id": referral["_id"]},
-                    {"$set": {"extracted_data.ErrorMessage": failure_text}}
-                )
-                browser.close()
-                return {"status": "error", "message": failure_text}
-            except:
+                #  MoA validity warning  -> ignore + close
+                if "MoA validity period is getting expired" in failure_text:
+                    try:
+                        page.locator("#ws_alert_dialog button.ui-dialog-titlebar-close").click()
+                    except Exception:
+                        pass
+                    
+
+                else:
+                  
+                    ocr_collection.update_one(
+                        {"_id": referral["_id"]},
+                        {"$set": {"extracted_data.ErrorMessage": failure_text}}
+                    )
+                    browser.close()
+                    return {"status": "error", "message": failure_text}
+
+            except Exception:
                 pass
+
+
 
             # --- Success Flow ---
             page.wait_for_selector("input[type='radio'][value='Y']")
@@ -1341,9 +1387,6 @@ def generate_claim_id():
 
             end_time = time.time()  # --- END TIMER
             print("Execution time for /generate_claim_id:", end_time - start_time, "seconds")
-
-
-
 
 
             return {"status": "success", "claim_id": claim_id}
@@ -1454,7 +1497,11 @@ def generate_claim_id_followup():
             page.wait_for_timeout(1000)
 
 
-# --- Login error popups (specific) ---
+
+
+
+
+
             error_message = None
 
             # 1) Failure / captcha popup
@@ -1474,23 +1521,51 @@ def generate_claim_id_followup():
                 except PlaywrightTimeoutError:
                     pass
 
+            # --- Yahan decide karo: real error vs MoA warning ---
             if error_message:
-                ocr_collection.update_one(
-                    {"_id": referral["_id"]},
-                    {"$set": {"extracted_data.ErrorMessage": error_message}}
-                )
-                browser.close()
-                return {"status": "error", "message": error_message}
+                clean_msg = " ".join(error_message.split())
+                print("LOGIN CLEAN MSG:", repr(clean_msg))
 
+                if "MoA validity period is getting expired" in clean_msg:
+                    # Sirf MoA warning -> ignore + dialog close
+                    try:
+                        page.locator("div.ui-dialog button.ui-dialog-titlebar-close").last.click(force=True)
+                    except Exception:
+                        pass
+                    # yahan RETURN NAHI karna, aage ka flow chalega
+                else:
+                    # Wrong captcha / wrong login / koi aur real error
+                    ocr_collection.update_one(
+                        {"_id": referral["_id"]},
+                        {"$set": {"extracted_data.ErrorMessage": error_message}}
+                    )
+                    browser.close()
+                    return {"status": "error", "message": error_message}
 
-
-            # --- Close popup if exists ---
+            # --- Agar yahan tak aa gaye, matlab login successful ---
+            # --- Sign-in ke baad jitne bhi dialogs hon, sab close karo ---
             try:
-                popup_selector = 'button.ui-dialog-titlebar-close'
-                if page.locator(popup_selector).is_visible():
-                    page.click(popup_selector)
-            except:
-                pass
+                dialog_close = page.locator("div.ui-dialog button.ui-dialog-titlebar-close")
+
+                for _ in range(5):  # safety: max 5 dialogs
+                    count = dialog_close.count()
+                    print("LOGIN DIALOG COUNT:", count)
+                    if count == 0:
+                        break
+
+                    btn = dialog_close.nth(count - 1)  # top-most dialog
+                    if btn.is_visible():
+                        print("CLICKING DIALOG INDEX:", count - 1)
+                        btn.click(force=True)
+                        page.wait_for_timeout(500)
+                    else:
+                        print("TOP DIALOG NOT VISIBLE, BREAK")
+                        break
+            except Exception as e:
+                print("LOGIN DIALOG CLOSE ERROR:", e)
+
+
+
 
             # --- Followup Flow ---
             page.locator("#ihaveseennmi").check()
